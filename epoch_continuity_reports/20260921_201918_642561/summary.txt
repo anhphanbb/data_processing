@@ -1,0 +1,22 @@
+AWE Epoch continuity audit
+Root: Y:\soc\l0c
+Pattern: *.nc
+Scan status: FINISHED
+Files scanned: 75523
+CONTINUOUS: 72258
+ISSUES: 3265
+INSUFFICIENT_DATA: 0
+ERROR: 0
+Files with warnings: 75523
+Events: {'gap': 2950, 'duplicate': 1980, 'irregular_interval': 5}
+Estimated missing frames summed over files: 47530
+Cadence: Cadence attribute, otherwise inferred median
+Interval tolerance: 0.05 seconds
+Gap: dt > max(1.5 * cadence, cadence + tolerance)
+All frame indices are zero-based. Epoch values use source units/time scale.
+Curve/travel distances and image arrays are not read or calculated.
+Continuity is tested within each file; inter-orbit gaps are not assessed.
+Missing frames are estimates, not proof of loss/removal or its cause.
+Counts include every matching filter/version; do not interpret as unique missing observations.
+files.csv: every file; issues.csv: problems/warnings; events.csv: individual events.
+Reports contain completed-file results even if interrupted.

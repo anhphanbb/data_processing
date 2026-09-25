@@ -1,0 +1,39 @@
+Epoch event product availability
+Events: D:\Github\data_processing\epoch_continuity_reports\20260921_201918_642561\events.csv
+Affected v01 source files: 2424
+Unique year/orbit pairs: 606
+Ignored non-v01/non-L0C event rows: 1267
+Rejected event rows: 0
+
+SOURCE FILES (L3C direct matches apply only to q20):
+l1f: v01=2272, other-version-only=0, not found=152, unknown=0, N/A=0
+l1r: v01=2241, other-version-only=0, not found=183, unknown=0, N/A=0
+l1a: v01=2205, other-version-only=0, not found=219, unknown=0, N/A=0
+l3c: v01=548, other-version-only=0, not found=58, unknown=0, N/A=1818
+
+INTERPRETATION:
+V01_FOUND: one or more nonempty same-version candidate files exist.
+OTHER_VERSION_ONLY: candidates exist, but no v01 candidate was found in a complete scan.
+NOT_FOUND: no candidate was found in a complete scan; NOT proof of failure.
+UNKNOWN: incomplete/unavailable scan prevents an absence/version conclusion. See product_matches.csv.
+Intermediate files may have been deleted or never retained. Check pipeline logs for failures.
+Matches use filename year/orbit/filter; timestamp and version may change in processing.
+A candidate does not prove derivation from the particular v01 input or survival of affected frames.
+L3C checks q20 swaths only. Non-q20 source rows have N/A direct status and an orbit_l3c_status.
+Orbit L1 statistics require ALL affected source filters to have candidates at that level.
+Orbit OTHER_VERSION_ONLY means all affected filters have candidates, with at least one lacking v01.
+Orbit NOT_FOUND means at least one affected filter has no candidate.
+Orbit L3C statistics mean a q20 swath candidate exists for that orbit.
+Statistics include file- and orbit-level counts, by event, filter, and year.
+Event groups overlap: a file/orbit may have several event types; do not sum groups.
+Percentages exclude UNKNOWN and NOT_APPLICABLE; they describe availability, not success rates.
+Every resolution/subfolder/version is inventoried. Multiple matches are listed individually.
+Separate year/orbit filenames at year boundaries may require manual review.
+No NetCDF data arrays or source files are modified. Input report may itself be partial.
+Files without events are outside this analysis; no clean-file comparison is inferred.
+
+ROOTS:
+l1f: Y:\soc\l1f
+l1r: Y:\soc\l1r
+l1a: Y:\soc\l1a
+l3c: Y:\soc\l3c
