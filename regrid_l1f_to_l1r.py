@@ -448,7 +448,12 @@ def process_file(source, target, master_lat, master_lon, positions, invert, opti
                         tick=time.perf_counter(); q=i-start
                         lat=np.ascontiguousarray(planes['Latitude'][q,::-1,:].T,dtype=np.float64)
                         lon=np.ascontiguousarray(planes['Longitude'][q,::-1,:].T,dtype=np.float64)
-                        counts=to_counts(planes['Radiance'][q,::-1,:].T)
+                        disk_radiance = planes['Radiance'][q,::-1,:].T
+                        counts=to_counts(disk_radiance)
+                        box_mode = getattr(src, 'MLSPB_Mask_Mode', '') in ('boxes_clean_reference', 'boxes_trim_reference')
+                        if box_mode:
+                            counts = counts.astype(np.float64)
+                            counts[~np.isfinite(disk_radiance)] = np.nan
                         if invert: lon[lon<0]+=360
                         px,py=positions[i]
                         ta=np.ascontiguousarray(master_lat[px-150:px+150,py-150:py+150])
@@ -462,7 +467,9 @@ def process_file(source, target, master_lat, master_lon, positions, invert, opti
                         result,valid=apply_map(counts,indices,weights)
                         timing['apply_s']+=time.perf_counter()-tick
                         tick=time.perf_counter()
-                        ta=np.where(valid,ta,np.nan); tb=np.where(valid,tb,np.nan)
+                        # Missing brightness must not remove grid anchors used downstream.
+                        geometry_valid = indices[0] >= 0 if box_mode else valid
+                        ta=np.where(geometry_valid,ta,np.nan); tb=np.where(geometry_valid,tb,np.nan)
                         if invert: tb[tb>180]-=360
                         output[0,q],output[1,q],output[2,q]=disk_plane(result),disk_plane(ta),disk_plane(tb)
                         timing['convert_s']+=time.perf_counter()-tick

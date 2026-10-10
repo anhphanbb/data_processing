@@ -358,8 +358,17 @@ def process_l2a(entries, options):
                     for f in ('p14', 'bkg', 'q20'):
                         shift = find_shift(la, lo, p[f]['Latitude'], p[f]['Longitude'])
                         aligned[f], bounds[f] = shift_to_reference(p[f]['Radiance'], shift)
+                    initial_valid = bounds['p14'] & bounds['bkg']
+                    all_valid = initial_valid & bounds['q20']
+                    if getattr(ref, 'MLSPB_Mask_Mode', '') in ('boxes_clean_reference', 'boxes_trim_reference'):
+                        # Zero counts encode absent radiance. Do not solve temperature
+                        # from a subset of the required aligned spectral measurements.
+                        measured = (p['p12']['Radiance'] > 0)
+                        for f in ('p14', 'q20', 'bkg'): measured &= aligned[f] > 0
+                        initial_valid &= measured
+                        all_valid &= measured
                     t = temperature(p['p12']['Radiance'], aligned['p14'], aligned['q20'],
-                                    bounds['p14'] & bounds['bkg'], bounds['p14'] & bounds['bkg'] & bounds['q20'])
+                                    initial_valid, all_valid)
                     for resolution, dst in outputs.items():
                         # Preserve the specific native-coordinate choice in source C++.
                         base_la, base_lo = ((p['q20']['Latitude'], p['q20']['Longitude'])
@@ -533,10 +542,19 @@ def process_swath(source, master, level, resolution, options):
                     x, y = position
                     if x < 0 or y < 0 or x+width > swath.shape[0] or y+ny > swath.shape[1]:
                         raise ValueError(f'Frame {frame}: strip at {position} outside master {swath.shape}')
-                    swath[x:x+width, y:y+ny] = data[j, first_column:first_column+width, :]
-                    pixel_epoch[x:x+width, y:y+ny] = epochs[frame]
+                    strip = data[j, first_column:first_column+width, :]
+                    keep = np.ones(strip.shape, bool)
+                    if getattr(src, 'MLSPB_Mask_Mode', '') in ('boxes_clean_reference', 'boxes_trim_reference'):
+                        keep = (strip > 0) & valid[first_column:first_column+width, :]
+                    # A missing sample must not erase an earlier valid overlap.
+                    view = swath[x:x+width, y:y+ny]
+                    view[keep] = strip[keep]
+                    epoch_view = pixel_epoch[x:x+width, y:y+ny]
+                    epoch_view[keep] = epochs[frame]
                     if cloud is not None:
-                        cloud_swath[x:x+width, y:y+ny] = cloud[j, 7, np.arange(ny)*3//ny].astype(np.int32)[None, :]
+                        values = np.broadcast_to(cloud[j, 7, np.arange(ny)*3//ny].astype(np.int32)[None, :], strip.shape)
+                        cloud_view = cloud_swath[x:x+width, y:y+ny]
+                        cloud_view[keep] = values[keep]
             for label, frames in [('skipped frames with no coordinate pairs', skipped_frames),
                                   ('used another anchor column', fallback_frames)]:
                 if frames:

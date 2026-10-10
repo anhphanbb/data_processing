@@ -1,63 +1,37 @@
 #!/usr/bin/env python3
-"""Filter and flat-field AWE L0C images after MLSPB detection.
+r"""Filter/flat-field AWE files after removing later duplicate Epoch frames.
 
-Standalone version with the C++ L1F NetCDF schema from the comparison report.
+Gaps of any length and positive irregular intervals are preserved and reported.
+No gap interpolation, no filled/unfilled branches, no long-gap skipping.
+Backward or invalid Epoch still fail; all filters must share the removal map.
+Default: mask MLSPB boxes, retain all observed frames, and use the exact legacy trim flat field before extending.
+Use --mlspb-mode trim for the legacy frame-selection algorithm.
+Retained samples are read directly from original files through a shared index map.
+No full cleaned-input copy is made; filtering/flat-fielding still modifies Radiance.
 
-Workflow
---------
-1. Read MLSPB from q20 in L0D (the filename may still contain l0c).
-2. Select one common retained frame range.
-3. Process matching L0C q20, p12, p14, and bkg files.
-4. Filter retained images using the existing NumPy/Numba implementation.
-5. Calculate a temporal-mean flat field separately for each filter.
-6. Write flat-fielded Radiance and trimmed ancillary data in C++-style L1F files.
+Outputs: L1F for all filters. Screen raw deduplicated frames in all four filters.
+The union of flagged original indices is removed from all filters BEFORE
+MLSPB selection, image filtering and flat-field calculation. No interpolation.
+Thresholds are heuristic; inspect the combined report for false positives.
+One per-orbit .bad_frames.csv records triggering filters and removed indices;
+the batch runner consolidates these into frame_quality_all_orbits.csv.
 
-Output changes
---------------
-* Only the 12 variables present in the supplied C++ report are written.
-* Image dimensions are (time, y_cross_track, x_along_track).
-* time is unlimited; both spatial dimensions are fixed.
-* Dimension IDs and variable definition order match the legacy C++ writer.
-  Dimensions are created x, y, time; image axes remain time, y, x.
-* Spatial axes are renamed, not transposed.
-* Reported global and variable metadata differences are corrected.
-* Extra MLSPB/noise/dark-response variables and box dimensions are omitted.
-* Compression is zlib level 1 with shuffle; source chunk sizes are retained.
-
-Common attributes not printed in the differences-only report are preserved
-from the input. Exact undocumented C++ attribute rules and numeric attribute
-storage types cannot be established from that report alone. Acquisition
-metadata use source values when present, otherwise the report's defaults.
-The full filename date/time comes directly from the first retained Epoch,
-including midnight/year rollover. Bad_pixel_mask and Dark_correction are
-omitted to match the supplied C++ report. The processing suffix is retained;
-Logical_file_id uses the corrected timestamp and omits the suffix. Software_version is the
-vNN product compatibility version, not a claim of C++ execution.
-
-Requirements
-------------
-    pip install numpy netCDF4 numba
-
-Numba is optional but strongly recommended. No updater or other local Python
-module is needed. Edit DEFAULT_MLSPB_INPUT, DEFAULT_L0C_INPUT, and DEFAULT_OUTPUT
-below to run directly in Spyder or another IDE.
-
-Terminal examples
------------------
-    python mlspb_filter_flatfield_cpp_metadata.py
-    python mlspb_filter_flatfield_cpp_metadata.py --self-test
-    python mlspb_filter_flatfield_cpp_metadata.py MLSPB_INPUT L0C_INPUT OUTPUT --workers 4 --numba-threads 4
-
-Existing outputs are protected by default. Use --overwrite to replace them.
+Defaults read August 2025 inputs and write a separate l1f_dedup_test folder.
+Run from Spyder/F5 with MLSPB inputs, or --skip-mlspb for an isolated L0C test.
+Normal pipeline positional paths and worker options remain supported.
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import tempfile
 import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -81,10 +55,16 @@ RADIANCE_READ_BLOCK_SIZE = 32
 RADIANCE_WRITE_BLOCK_SIZE = 100
 
 # Settings for running directly from Visual Studio, Spyder, or an IDE.
-DEFAULT_MLSPB_INPUT = r"E:\soc\l0d\2023\12"
-DEFAULT_L0C_INPUT = r"E:\soc\l0c\2023\12"
-DEFAULT_OUTPUT = r"E:\soc\l1f\2023\12"
-DEFAULT_SELECTION_MODE = "cxx"  # "cxx" or "clean"
+DEFAULT_MLSPB_INPUT = r"E:\soc\l0d\2025\08"
+DEFAULT_L0C_INPUT = r"E:\soc\l0c\2025\08"
+DEFAULT_OUTPUT = r"E:\soc\l1f_dedup_test\2025\08"
+DEFAULT_SELECTION_MODE = "cxx"  # Legacy trim mode: "cxx" or "clean"
+DEFAULT_MLSPB_MODE = "boxes"  # "boxes" or "trim"
+DEFAULT_MIN_CLEAN_FRAMES = 100  # Operational guard; validate with real orbits
+BAD_FRAME_SCREENING = True  # False disables screening, removal and previews.
+SAVE_BAD_FRAME_IMAGES = True
+BKG_SCREENING_TOLERANCE = 1.5  # Temporal brightness outliers only: 1.0 original, 2.0 twice tolerance.
+TEMP_ROOT = None  # None: beside L1F outputs; or set a fast local SSD folder.
 DEFAULT_RECURSIVE = False
 DEFAULT_OVERWRITE = True
 DEFAULT_ORBITS_AT_A_TIME = 6
@@ -420,6 +400,219 @@ def select_frame_range(flagged: np.ndarray, mode: str = "cxx") -> tuple[int, int
     return new_first, new_last
 
 
+# Exact inclusive detector ranges from 4_and_5_mlspb.py (disk y, x order).
+MLSPB_RANGES = ((0, 41), (42, 84), (85, 127), (128, 170), (171, 213), (214, 255))
+
+
+def read_mlspb_boxes(path):
+    with _import_netcdf4().Dataset(path) as ds:
+        var = ds[MLSPB_NAME]
+        dims = ('time', 'y_box_across_track', 'x_box_along_track')
+        if set(var.dimensions) != set(dims) or var.ndim != 3:
+            raise ValueError(f'Expected MLSPB dimensions {dims}; got {var.dimensions}')
+        a = np.asarray(np.ma.filled(np.ma.asarray(var[:], dtype=float), np.nan))
+        a = np.transpose(a, [var.dimensions.index(d) for d in dims])
+        if a.shape[1:] != (6, 6) or not np.all(np.isfinite(a)) or not np.all((a == 0) | (a == 1)):
+            raise ValueError('MLSPB must contain finite binary flags on a 6x6 grid')
+        return a.astype(bool)
+
+
+def box_mask(boxes, shape=(256, 256)):
+    if shape != (256, 256):
+        raise ValueError(f'MLSPB detector mapping requires 256x256, got {shape}')
+    mask = np.zeros(shape, bool)
+    for y, x in np.argwhere(boxes):
+        y0, y1 = MLSPB_RANGES[y]; x0, x1 = MLSPB_RANGES[x]
+        mask[y0:y1+1, x0:x1+1] = True
+    return mask
+
+
+def longest_clean_interval(boxes, epoch, min_frames):
+    clean = ~np.any(boxes, axis=(1, 2))
+    # Do not call a span across a time gap one continuous reference interval.
+    delta = np.diff(epoch)
+    positive = delta[delta > 0]
+    cadence = EPOCH_CADENCE_SECONDS or (float(np.median(positive)) if positive.size else 0)
+    best = (0, 0); start = 0
+    for i in range(len(clean)):
+        if i and delta[i-1] > 1.5*cadence:
+            if i-start > best[1]-best[0]: best = (start, i)
+            start = i
+        if not clean[i]:
+            if i-start > best[1]-best[0]: best = (start, i)
+            start = i+1
+    if len(clean)-start > best[1]-best[0]: best = (start, len(clean))
+    if best[1]-best[0] < min_frames:
+        raise ValueError(f'Longest fully clean interval has {best[1]-best[0]} frames; '
+                         f'need {min_frames}. No contaminated-reference fallback is used.')
+    return best  # half-open, deduplicated frame indices
+
+
+def filter_image_masked(image, valid):
+    """Same bright/dark scheme, excluding invalid samples from every statistic."""
+    a = np.asarray(image, dtype=np.uint16)
+    valid = np.asarray(valid, bool)
+    if valid.all(): return filter_image_cpp(a)
+    if not valid.any(): return np.zeros_like(a)
+    values = a[valid]
+    threshold = np.searchsorted(np.cumsum(np.bincount(values, minlength=65536)), .95*values.size)
+    ny, nx = a.shape
+    p = np.pad(a.astype(np.float64), 3, mode='edge')
+    v = np.pad(valid, 3, mode='edge')
+    def shifted(dy, dx):
+        return p[3+dy:3+dy+ny, 3+dx:3+dx+nx], v[3+dy:3+dy+ny, 3+dx:3+dx+nx]
+    total = np.zeros(a.shape); weight = np.zeros(a.shape)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            b, good = shifted(dy, dx); w = float(GAUSSIAN_3X3_CPP[dy+1, dx+1])
+            total += np.where(good, b*w, 0); weight += good*w
+    mean = np.divide(total, weight, out=np.zeros_like(total), where=weight > 0)
+    bright = valid & (mean < a.astype(float)-threshold/2)
+    stage = a.copy()
+    if bright.any():
+        offsets = [(dy, dx) for dx in range(-3, 4) for dy in (2, -2)] + [(-1, 2)]
+        samples = []
+        for dy, dx in offsets:
+            b, good = shifted(dy, dx)
+            samples.append(np.where(good[bright], b[bright], np.inf))
+        samples = np.sort(np.array(samples), axis=0)
+        n = np.isfinite(samples).sum(axis=0)
+        # Full support reproduces C++ order statistic #8; partial support uses its median.
+        rank = np.where(n == 15, 8, np.maximum(0, n//2))
+        replacement = samples[rank, np.arange(len(n))]
+        old = stage[bright].copy(); use = n > 0
+        old[use] = replacement[use].astype(np.uint16); stage[bright] = old
+    p = np.pad(stage.astype(float), 3, mode='edge')
+    total.fill(0); weight.fill(0)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == dx == 0: continue
+            b, good = shifted(dy, dx)
+            total += np.where(good, b, 0); weight += good
+    mean = np.divide(total, weight, out=np.zeros_like(total), where=weight > 0)
+    dark = valid & (weight > 0) & (mean-stage.astype(float) > 1000)
+    bounds = np.zeros_like(valid); bounds[1:-2, 1:-2] = True
+    use = dark & bounds
+    stage[use] = np.trunc(mean[use]).astype(np.uint16)
+    stage[~valid] = 0
+    return stage
+
+
+def flatfield_image_masked(image, flat_field, valid):
+    """Return float counts and normalization code: 0 none, 1 center, 2 footprint."""
+    a = np.asarray(image, dtype=float); ff = np.asarray(flat_field, dtype=float)
+    good = valid & np.isfinite(ff) & (ff > 0)
+    divided = np.divide(a, ff, out=np.full(a.shape, np.nan), where=good)
+    ny, nx = a.shape
+    support = good & (a > 0)
+    center = np.zeros_like(good)
+    center[ny//2-10:ny//2+10, nx//2-10:nx//2+10] = True
+    norm = support & center
+    code = 1
+    if not norm.any(): norm = support; code = 2
+    if not norm.any(): return np.full(a.shape, np.nan), 0
+    scale = a[norm].mean()/divided[norm].mean()
+    corrected = divided*scale
+    # Repair only valid pixels, and only using valid neighboring ratios.
+    p = np.pad(divided, 1, constant_values=np.nan)
+    total = np.zeros_like(a); count = np.zeros_like(a)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == dx == 1: continue
+            b = p[dy:dy+ny, dx:dx+nx]; ok = np.isfinite(b)
+            total += np.where(ok, b, 0); count += ok
+    repair = good & ((corrected > 50000) | (corrected == 0)) & (count > 0)
+    corrected[repair] = total[repair]/count[repair]*scale
+    corrected[~good] = np.nan
+    return np.clip(np.trunc(corrected), 0, 65535), code
+
+
+def process_box_masked_file(input_path, output_path, boxes, reference, overwrite,
+                           label, numba_threads, quality_metrics, frame_indices=None):
+    """Run the unchanged trim algorithm, then extend with its exact flat field."""
+    if output_path.exists() and not overwrite: raise FileExistsError(output_path)
+    if set_num_threads is not None: set_num_threads(numba_threads)
+    netCDF4 = _import_netcdf4()
+    lo, hi = reference
+    temp_parent = Path(TEMP_ROOT) if TEMP_ROOT else output_path.parent
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='awe_trim_reference_', dir=temp_parent) as temp:
+        baseline_path = Path(temp)/output_path.name
+        calibration = {}
+        print(f'{label}: run original trim processing first, frames {lo}..{hi-1}', flush=True)
+        _process_filter_file_continuous(input_path, baseline_path, lo, hi-1, False,
+                                       label, True, numba_threads, calibration=calibration, frame_indices=frame_indices)
+        _extend_trim_result(input_path, output_path, baseline_path, boxes, reference,
+                            calibration['flat_field'], label, quality_metrics, frame_indices)
+
+
+def _extend_trim_result(input_path, output_path, baseline_path, boxes, reference,
+                        ff, label, quality_metrics, frame_indices=None):
+    """Copy unmasked baseline values exactly; calculate only the added frames."""
+    netCDF4 = _import_netcdf4()
+    lo, hi = reference
+    with netCDF4.Dataset(input_path) as src, netCDF4.Dataset(baseline_path) as baseline:
+        rad = src[RADIANCE_NAME]
+        indices = np.arange(rad.shape[0]) if frame_indices is None else np.asarray(frame_indices)
+        if len(indices) != len(boxes): raise ValueError('MLSPB/retained-input length mismatch')
+        def read_frame(i):
+            raw = raw_block[i-start]
+            geo = None if geometry_block is None else geometry_block[i-start]
+            valid = np.isfinite(raw) & (raw >= 0)
+            if geo is not None: valid &= geo
+            valid &= ~box_mask(boxes[i], raw.shape)
+            return raw, valid, geo
+        clone_trimmed_netcdf(input_path, output_path, 0, len(boxes)-1,
+                            skip_data_variables=frozenset((RADIANCE_NAME,)), frame_indices=indices)
+        try:
+            with netCDF4.Dataset(output_path, 'r+') as dst:
+                dst.MLSPB_Mask_Mode = 'boxes_trim_reference'
+                dst.Flat_Field_Reference_Start = int(lo)
+                dst.Flat_Field_Reference_Stop_Exclusive = int(hi)
+                dst.Flat_Field_Reference_Frames = int(hi-lo)
+                dst.Flat_Field_Reference_Epoch = np.array([read_epoch(input_path)[indices[lo]], read_epoch(input_path)[indices[hi-1]]])
+                dst.Flat_Field_Policy = 'Exact legacy trim interval, filtering, denominator and normalization; copy baseline then extend using its frozen flat field'
+                dst.Trim_Overlap_Policy = 'Baseline Radiance copied exactly except explicitly MLSPB-masked boxes become NaN'
+                dst.MLSPB_Box_Ranges = json.dumps(MLSPB_RANGES)
+                dst.Missing_Radiance_Policy = 'NaN missing; coordinates retained for geometry'
+                code = dst.createVariable('Flat_Field_Normalization', 'u1', ('time',), fill_value=False)
+                code.flag_values = np.array([0, 1, 2, 3], dtype='u1')
+                code.flag_meanings = 'no_valid_support central_20x20 valid_footprint_fallback copied_legacy_trim'
+                countvar = dst.createVariable('MLSPB_Masked_Pixels', 'i4', ('time',), fill_value=False)
+                dst[RADIANCE_NAME].set_auto_maskandscale(False)
+                fallbacks = empty = 0
+                for start in range(0, len(boxes), RADIANCE_READ_BLOCK_SIZE):
+                    end = min(start+RADIANCE_READ_BLOCK_SIZE, len(boxes))
+                    raw_block = read_selected_images(rad, indices[start:end])
+                    geometry_block = selected_latitude_mask(src, indices[start:end], raw_block.shape[1:])
+                    saved = np.empty((end-start, 256, 256), np.float32)
+                    methods = []; masked = []
+                    for q, i in enumerate(range(start, end)):
+                        raw, valid, geo = read_frame(i)
+                        if quality_metrics is not None: quality_metrics.append(raw_frame_metrics(raw, geo))
+                        if lo <= i < hi:
+                            # Do not re-filter, re-normalize, or quantize baseline values.
+                            saved[q] = _read_image_block(baseline[RADIANCE_NAME], i-lo, i-lo+1)[0]
+                            saved[q][box_mask(boxes[i])] = np.nan
+                            method = 3
+                        else:
+                            filtered = CPP_FLOAT32_ROUNDTRIP_LUT[filter_image_masked(radiance_to_cpp_uint16(raw), valid)]
+                            corrected, method = flatfield_image_masked(filtered, ff, valid)
+                            saved[q] = corrected.astype(np.float32)/np.float32(RADIANCE_SCALE)
+                        methods.append(method); masked.append(int(box_mask(boxes[i]).sum()))
+                        fallbacks += method == 2; empty += method == 0
+                    _write_image_block(dst[RADIANCE_NAME], start, saved)
+                    code[start:end] = methods; countvar[start:end] = masked
+                    print(f'  {label}: box-masked flat field {end}/{len(boxes)}', flush=True)
+                dst.Flat_Field_Fallback_Frames = int(fallbacks)
+                dst.Flat_Field_Empty_Frames = int(empty)
+            update_l1f_metadata(output_path)
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            raise
+
+
+
 def read_mlspb_flags(q20_path: Path) -> np.ndarray:
     netCDF4 = _import_netcdf4()
     with netCDF4.Dataset(q20_path, "r") as dataset:
@@ -551,7 +744,30 @@ def output_path_for(input_path: Path, output_dir: Path, stamp: str) -> Path:
     return output_dir / filename
 
 
-def _copy_variable_data(source_var, output_var, first: int, last: int) -> None:
+def selected_runs(indices):
+    """Yield destination slices and contiguous source slices, in retained order."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 1 or not len(indices) or np.any(indices < 0) or np.any(np.diff(indices) <= 0):
+        raise ValueError('Retained indices must be nonempty, nonnegative and strictly increasing')
+    boundaries = np.r_[0, np.flatnonzero(np.diff(indices) != 1)+1, len(indices)]
+    for a, b in zip(boundaries[:-1], boundaries[1:]):
+        yield slice(int(a), int(b)), slice(int(indices[a]), int(indices[b-1])+1)
+
+
+def read_selected_images(variable, indices):
+    blocks = [_read_image_block(variable, src.start, src.stop)
+              for _, src in selected_runs(indices)]
+    return blocks[0] if len(blocks)==1 else np.concatenate(blocks, axis=0)
+
+
+def selected_latitude_mask(dataset, indices, shape):
+    if 'Latitude' not in dataset.variables or TIME_DIM not in dataset['Latitude'].dimensions:
+        return None
+    latitude = read_selected_images(dataset['Latitude'], indices)
+    return np.isfinite(latitude) if latitude.shape[1:] == shape else None
+
+
+def _copy_variable_data(source_var, output_var, first: int, last: int, frame_indices=None) -> None:
     output_var.set_auto_maskandscale(False)
     source_var.set_auto_maskandscale(False)
     if TIME_DIM not in source_var.dimensions:
@@ -565,7 +781,14 @@ def _copy_variable_data(source_var, output_var, first: int, last: int) -> None:
         dst_key = [slice(None)] * output_var.ndim
         src_key[axis] = slice(first + out_start, first + out_start + count)
         dst_key[axis] = slice(out_start, out_start + count)
-        output_var[tuple(dst_key)] = source_var[tuple(src_key)]
+        if frame_indices is None:
+            output_var[tuple(dst_key)] = source_var[tuple(src_key)]
+        else:
+            indices = frame_indices[first+out_start:first+out_start+count]
+            for dest, src in selected_runs(indices):
+                src_key[axis] = src
+                dst_key[axis] = slice(out_start+dest.start, out_start+dest.stop)
+                output_var[tuple(dst_key)] = source_var[tuple(src_key)]
 
 
 # C++ L1F writer functions are embedded below (no companion module required).
@@ -576,6 +799,7 @@ def clone_trimmed_netcdf(
     first: int,
     last: int,
     skip_data_variables: frozenset[str] = frozenset(),
+    frame_indices=None,
 ) -> None:
     """Write the L1F schema from the supplied C++ comparison report.
 
@@ -623,7 +847,13 @@ def clone_trimmed_netcdf(
             raise ValueError(f"Missing C++ L1F variables in {input_path}: {missing}")
         if "time" not in source.dimensions:
             raise ValueError("Input has no time dimension")
-        if first < 0 or last < first or last >= len(source.dimensions["time"]):
+        source_count = len(source.dimensions["time"])
+        if frame_indices is not None:
+            frame_indices = np.asarray(frame_indices, dtype=np.int64)
+            list(selected_runs(frame_indices))
+            if frame_indices[-1] >= source_count: raise ValueError('Retained index outside source')
+        logical_count = source_count if frame_indices is None else len(frame_indices)
+        if first < 0 or last < first or last >= logical_count:
             raise ValueError(f"Invalid inclusive retained range {first}..{last}")
         source_radiance = source.variables["Radiance"]
         spatial_shape = source_radiance.shape[1:]
@@ -687,15 +917,10 @@ def clone_trimmed_netcdf(
                 for name in required_names:
                     source_var = source.variables[name]
                     dimensions = target_image_dims if name in image_names else ("time",)
-                    # Keep source chunk sizes for throughput, but set actual
-                    # zlib level 1 and shuffle to agree with C++ storage labels.
+                    # One full detector frame per compressed chunk, independent of input layout.
                     kwargs = dict(zlib=True, complevel=1, shuffle=True)
-                    chunks = source_var.chunking()
-                    if isinstance(chunks, (list, tuple)):
-                        kwargs["chunksizes"] = tuple(
-                            max(1, min(int(c), output_count if i == 0 else source_var.shape[i]))
-                            for i, c in enumerate(chunks)
-                        )
+                    kwargs['chunksizes'] = ((1,) + tuple(spatial_shape) if name in image_names
+                                            else (min(1024, output_count),))
                     # Omitting fill_value avoids an explicit _FillValue attr;
                     # standard prefill stays enabled until every value is written.
                     output_var = output.createVariable(
@@ -720,7 +945,10 @@ def clone_trimmed_netcdf(
                         )
                     output_var.setncatts(attrs)
                     if name not in skip_data_variables:
-                        _copy_variable_data(source_var, output_var, first, last)
+                        copy_start = time.perf_counter()
+                        _copy_variable_data(source_var, output_var, first, last, frame_indices)
+                        if name in image_names:
+                            print(f'  {output_path.name}: copy {name} {time.perf_counter()-copy_start:.1f}s', flush=True)
             update_l1f_metadata(output_path)
         except Exception:
             output_path.unlink(missing_ok=True)
@@ -857,7 +1085,85 @@ def _print_progress(message: str, separate_lines: bool) -> None:
     print(message, end="\n" if separate_lines else "\r", flush=True)
 
 
-def process_filter_file(
+# Heuristic rejection thresholds, applied to all four filters before flat-fielding.
+QUALITY_NEIGHBORS = 5
+QUALITY_MIN_VALID_FRACTION = 0.50
+QUALITY_EXTREME_ZERO_FRACTION = 0.95
+QUALITY_SATURATION_FRACTION = 0.05
+QUALITY_ROBUST_Z = 8.0
+QUALITY_RELATIVE_BRIGHTNESS_CHANGE = 0.50
+
+
+def raw_frame_metrics(image,geometry):
+    values=np.asarray(image,dtype=np.float64)
+    support=np.ones(values.shape,dtype=bool) if geometry is None else np.asarray(geometry,dtype=bool)
+    n=int(support.sum());finite=support&np.isfinite(values)
+    sample=values[finite]
+    return dict(footprint_pixels=n,valid_fraction=float(finite.sum()/n) if n else 0.0,
+                zero_fraction=float(np.mean(sample<=0)) if sample.size else 0.0,
+                saturation_fraction=float(np.mean(sample>=65535/RADIANCE_SCALE)) if sample.size else 0.0,
+                median_radiance=float(np.median(sample)) if sample.size else np.nan,
+                p99_radiance=float(np.percentile(sample,99)) if sample.size else np.nan)
+
+
+def report_path_for(output_path, suffix):
+    return (output_path.parent / 'reports' / output_path.name).with_suffix(suffix)
+
+
+def quality_rows(metrics,plan,first=0,filter_name=None):
+    tolerance = BKG_SCREENING_TOLERANCE if str(filter_name).lower() == 'bkg' else 1.0
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError('BKG_SCREENING_TOLERANCE must be finite and positive')
+    rows=[];t=plan['epoch'][first:first+len(metrics)]
+    originals=plan['left'][first:first+len(metrics)]
+    for i,item in enumerate(metrics):
+        reasons=[]
+        if item['footprint_pixels']==0:reasons.append('no_valid_geometry')
+        elif item['valid_fraction']<QUALITY_MIN_VALID_FRACTION:reasons.append('low_valid_fraction')
+        if item['zero_fraction']>=QUALITY_EXTREME_ZERO_FRACTION:reasons.append('mostly_zero_or_negative')
+        if item['saturation_fraction']>=QUALITY_SATURATION_FRACTION:reasons.append('many_pixels_at_count_limit')
+        # Compare nearby exposures only; do not use frames across a long gap.
+        neighbors=[j for j in range(max(0,i-QUALITY_NEIGHBORS),min(len(metrics),i+QUALITY_NEIGHBORS+1))
+                   if j!=i and abs(t[j]-t[i]) <= (QUALITY_NEIGHBORS+1)*plan['cadence']]
+        for field in ('median_radiance','p99_radiance'):
+            reference=np.array([metrics[j][field] for j in neighbors
+                                if metrics[j]['valid_fraction']>=QUALITY_MIN_VALID_FRACTION],dtype=float)
+            reference=reference[np.isfinite(reference)]
+            value=item[field]
+            if len(reference)>=4 and np.isfinite(value):
+                baseline=float(np.median(reference));mad=float(np.median(np.abs(reference-baseline)))
+                threshold=tolerance*max(QUALITY_ROBUST_Z*1.4826*mad,
+                              QUALITY_RELATIVE_BRIGHTNESS_CHANGE*abs(baseline),0.001)
+                if abs(value-baseline)>threshold:reasons.append(field+'_temporal_outlier')
+        dt=float(t[i]-t[i-1]) if i else ''
+        dt_next=float(t[i+1]-t[i]) if i+1<len(t) else ''
+        near_gap=(i>0 and dt>1.5*plan['cadence']) or (i+1<len(t) and dt_next>1.5*plan['cadence'])
+        rows.append(dict(l1f_frame_index=i,original_frame_index=int(originals[i]),epoch=float(t[i]),
+                         dt_previous_s=dt,dt_next_s=dt_next,adjacent_to_gap=int(near_gap),
+                         **item,review_flag=int(bool(reasons)),reasons=';'.join(reasons)))
+    return rows
+
+
+def write_quality_report(output_path,metrics,plan,first):
+    filter_name = parse_name(output_path).group('filter').lower()
+    rows=quality_rows(metrics,plan,first,filter_name=filter_name)
+    target=report_path_for(output_path,'.frame_quality.csv')
+    flagged=sum(r['review_flag'] for r in rows)
+    if flagged:
+        target.parent.mkdir(parents=True,exist_ok=True)
+        with target.open('w',newline='',encoding='utf-8-sig') as stream:
+            writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    return dict(report=str(target) if flagged else None,frames_review_flagged=flagged,
+                scope='raw retained input before filtering; within finite Latitude footprint',
+                action='review only; no exclusion from filtering or flat-field average',
+                thresholds=dict(min_valid_fraction=QUALITY_MIN_VALID_FRACTION,
+                                zero_fraction=QUALITY_EXTREME_ZERO_FRACTION,
+                                saturation_fraction=QUALITY_SATURATION_FRACTION,
+                                robust_z=QUALITY_ROBUST_Z,relative_change=QUALITY_RELATIVE_BRIGHTNESS_CHANGE,
+                                temporal_tolerance_multiplier=BKG_SCREENING_TOLERANCE if filter_name=='bkg' else 1.0))
+
+
+def _process_filter_file_continuous(
     input_path: Path,
     output_path: Path,
     first: int,
@@ -866,6 +1172,10 @@ def process_filter_file(
     progress_label: str | None = None,
     separate_progress_lines: bool = False,
     numba_threads: int = DEFAULT_NUMBA_THREADS,
+    inserted_frames: np.ndarray | None = None,
+    quality_metrics: list | None = None,
+    calibration: dict | None = None,
+    frame_indices=None,
 ) -> None:
     netCDF4 = _import_netcdf4()
     if set_num_threads is not None:
@@ -879,10 +1189,18 @@ def process_filter_file(
     clone_start = time.perf_counter()
     clone_trimmed_netcdf(
         input_path, output_path, first, last,
-        skip_data_variables=frozenset((RADIANCE_NAME,)),
+        skip_data_variables=frozenset((RADIANCE_NAME,)), frame_indices=frame_indices,
     )
     clone_seconds = time.perf_counter() - clone_start
     frame_count = last - first + 1
+    selected_indices = (np.arange(first,last+1) if frame_indices is None
+                        else np.asarray(frame_indices[first:last+1], dtype=np.int64))
+    inserted_frames = (np.zeros(frame_count,dtype=bool) if inserted_frames is None
+                       else np.asarray(inserted_frames,dtype=bool))
+    real_frame_count = int((~inserted_frames).sum())
+    if inserted_frames.shape != (frame_count,) or real_frame_count == 0:
+        output_path.unlink(missing_ok=True)
+        raise ValueError('No observed frames remain for flat-field construction')
 
     try:
         # Compact uint16 cube avoids an intermediate Radiance write and rereads.
@@ -909,15 +1227,17 @@ def process_filter_file(
                 block_input_stop = block_input_start + block_count
 
                 operation_start = time.perf_counter()
-                radiance_block = _read_image_block(
-                    source_var, block_input_start, block_input_stop
-                )
+                block_indices = selected_indices[block_out_start:block_out_start+block_count]
+                radiance_block = read_selected_images(source_var, block_indices)
                 radiance_read_seconds += time.perf_counter() - operation_start
                 operation_start = time.perf_counter()
                 integer_block = radiance_to_cpp_uint16(radiance_block)
                 input_conversion_seconds += time.perf_counter() - operation_start
                 operation_start = time.perf_counter()
-                filtered_block = filter_cube_cpp(integer_block)
+                real_block = ~inserted_frames[block_out_start:block_out_start+block_count]
+                filtered_block = np.zeros_like(integer_block)
+                if real_block.any():
+                    filtered_block[real_block] = filter_cube_cpp(integer_block[real_block])
                 filter_compute_seconds += time.perf_counter() - operation_start
 
                 # Preserve the former intermediate float32 storage round trip.
@@ -925,11 +1245,12 @@ def process_filter_file(
                 filtered_block = CPP_FLOAT32_ROUNDTRIP_LUT[filtered_block]
                 roundtrip_seconds += time.perf_counter() - operation_start
                 operation_start = time.perf_counter()
-                valid_block = _latitude_valid_mask_block(
-                    source, block_input_start, block_input_stop,
-                    filtered_block.shape[1:],
-                )
+                valid_block = selected_latitude_mask(source, block_indices, filtered_block.shape[1:])
                 filter_latitude_seconds += time.perf_counter() - operation_start
+                if quality_metrics is not None:
+                    for q in range(block_count):
+                        quality_metrics.append(raw_frame_metrics(radiance_block[q],
+                            valid_block[q] if valid_block is not None else None))
 
                 if not validity_cache_decided:
                     validity_cache_decided = True
@@ -973,8 +1294,8 @@ def process_filter_file(
                     block_out_start : block_out_start + block_count
                 ] = filtered_block
                 # Preserve the frame-by-frame floating-point accumulation order.
-                for filtered in filtered_block:
-                    flat_field += filtered.astype(np.float64) / frame_count
+                for filtered in filtered_block[real_block]:
+                    flat_field += filtered.astype(np.float64) / real_frame_count
                 processed = block_out_start + block_count
                 if block_out_start == 0 or processed % 100 == 0 or processed == frame_count:
                     _print_progress(
@@ -1035,6 +1356,9 @@ def process_filter_file(
                     )
                     latitude_seconds += time.perf_counter() - operation_start
                 for local_index, index in enumerate(range(block_start, block_stop)):
+                    if inserted_frames[index]:
+                        saved_block[local_index] = np.nan
+                        continue
                     filtered = filtered_cube[index]
                     operation_start = time.perf_counter()
                     corrected = flatfield_image_cpp(filtered, flat_field)
@@ -1082,9 +1406,261 @@ def process_filter_file(
         )
         print(f"      {progress_prefix}{latitude_label}{latitude_seconds:.1f}s")
         print(f"      {progress_prefix}NetCDF Radiance write:  {radiance_write_seconds:.1f}s")
+        if calibration is not None:
+            calibration['flat_field'] = flat_field.copy()
     except Exception:
         output_path.unlink(missing_ok=True)
         raise
+
+
+# Epoch repair runs before MLSPB boundary selection and image filtering.
+# Values are in decoded Epoch seconds, as used by AWE L0C.
+EPOCH_CADENCE_SECONDS = 1.1015625  # Set None to infer median positive spacing.
+EPOCH_INTERVAL_TOLERANCE = 0.01  # seconds; allows timestamp quantization/jitter
+EPOCH_DUPLICATE_TOLERANCE = 1e-6
+def read_epoch(path):
+    with _import_netcdf4().Dataset(path) as ds:
+        var = ds.variables['Epoch']
+        if var.dimensions != ('time',):
+            raise ValueError(f'{path}: Epoch must have dimensions (time,)')
+        return _as_plain_array(var[:], fill=np.nan).astype(np.float64)
+
+
+def verify_continuity(epoch, cadence):
+    values = np.asarray(epoch,dtype=np.float64)
+    if not len(values) or not np.isfinite(values).all():
+        raise ValueError('Epoch empty or non-finite')
+    dt = np.diff(values)
+    bad = np.flatnonzero(dt <= EPOCH_DUPLICATE_TOLERANCE)
+    if bad.size:
+        i=int(bad[0]);raise ValueError(f'Epoch not strictly increasing: {i}->{i+1}, dt={dt[i]}')
+    gaps = dt > 1.5*cadence
+    irregular = (np.abs(dt-cadence)>EPOCH_INTERVAL_TOLERANCE)&~gaps
+    return dict(frames=len(values),min_dt_s=float(dt.min()) if len(dt) else None,
+                max_dt_s=float(dt.max()) if len(dt) else None,
+                continuity='GAPS_OR_IRREGULAR_INTERVALS_RETAINED' if (gaps|irregular).any() else 'PASS',
+                gap_intervals=int(gaps.sum()),irregular_intervals=int(irregular.sum()),
+                monotonicity='PASS')
+
+
+def epoch_repair_plan(epoch):
+    epoch=np.asarray(epoch,dtype=np.float64)
+    if epoch.ndim!=1 or not epoch.size or not np.isfinite(epoch).all():
+        raise ValueError('Cannot process empty or invalid Epoch')
+    positive=np.diff(epoch);positive=positive[positive>EPOCH_DUPLICATE_TOLERANCE]
+    cadence=EPOCH_CADENCE_SECONDS
+    if cadence is None:
+        if not positive.size:raise ValueError('Cannot infer cadence')
+        cadence=float(np.median(positive))
+    if not np.isfinite(cadence) or cadence<=0:raise ValueError('Invalid cadence')
+    kept=[0];events=[]
+    for i in range(1,len(epoch)):
+        previous=kept[-1];dt=float(epoch[i]-epoch[previous])
+        if abs(dt)<=EPOCH_DUPLICATE_TOLERANCE:
+            events.append(dict(event='duplicate',kept_original_index=previous,
+                               removed_original_index=i,dt_s=dt));continue
+        if dt<0:raise ValueError(f'Backward Epoch {previous}->{i}: {dt} seconds')
+        if abs(dt-cadence)>EPOCH_INTERVAL_TOLERANCE:
+            events.append(dict(event='gap' if dt>1.5*cadence else 'irregular_interval',
+                               index_before=previous,index_after=i,dt_s=dt,action='unchanged'))
+        kept.append(i)
+    kept=np.asarray(kept,dtype=int);values=epoch[kept]
+    return dict(left=kept,right=kept,weight=np.zeros(len(kept)),epoch=values,
+                inserted=np.zeros(len(kept),dtype=bool),cadence=cadence,
+                original_frames=len(epoch),events=events,check=verify_continuity(values,cadence))
+
+
+def repair_report(plan):
+    return dict(gap_treatment='unchanged',original_frames=plan['original_frames'],
+                repaired_frames=len(plan['epoch']),inserted_frames=0,
+                removed_duplicates=sum(e['event']=='duplicate' for e in plan['events']),
+                removed_bad_frames=plan.get('removed_bad_frames',0),
+                expected_dt_s=plan['cadence'],tolerance_s=EPOCH_INTERVAL_TOLERANCE,
+                events=plan['events'],after_repair=plan['check'],
+                indices='zero-based original L0C indices; retained range uses indices after duplicate and bad-frame removal',
+                interpolation='none',duplicate_policy='keep first timestamp occurrence; remove later repeats')
+
+
+def write_repaired_input(source_path,target_path,plan):
+    """Raw storage copy of retained samples; no decoding/repacking/interpolation."""
+    nc=_import_netcdf4()
+    with nc.Dataset(source_path) as src,nc.Dataset(target_path,'w') as dst:
+        if src.groups:raise ValueError('Nested NetCDF groups unsupported')
+        dst.setncatts({k:src.getncattr(k) for k in src.ncattrs()})
+        for name,dim in src.dimensions.items():
+            dst.createDimension(name,len(plan['epoch']) if name=='time' else len(dim))
+        for name,var in src.variables.items():
+            kwargs={}
+            if '_FillValue' in var.ncattrs():kwargs['fill_value']=var.getncattr('_FillValue')
+            if var.ndim and np.dtype(var.dtype).kind in 'fiu':kwargs.update(zlib=True,complevel=1)
+            out=dst.createVariable(name,var.datatype,var.dimensions,**kwargs)
+            out.setncatts({k:var.getncattr(k) for k in var.ncattrs() if k!='_FillValue'})
+            var.set_auto_maskandscale(False);out.set_auto_maskandscale(False)
+            if 'time' not in var.dimensions:out[...]=var[...];continue
+            axis=var.dimensions.index('time')
+            for start in range(0,len(plan['epoch']),32):
+                stop=min(start+32,len(plan['epoch']))
+                a=[slice(None)]*var.ndim;b=a.copy()
+                a[axis]=plan['left'][start:stop];b[axis]=slice(start,stop)
+                out[tuple(b)]=var[tuple(a)]
+    verify_continuity(read_epoch(target_path),plan['cadence'])
+
+
+def process_filter_file(input_path, output_path, first, last, overwrite,
+                        progress_label=None, separate_progress_lines=False,
+                        numba_threads=DEFAULT_NUMBA_THREADS, box_config=None, shared_plan=None):
+    """first/last index the repaired timeline selected during orbit preparation."""
+    plan = shared_plan if shared_plan is not None else epoch_repair_plan(read_epoch(input_path))
+    report = repair_report(plan)
+    report.update(source=str(input_path), output=str(output_path), retained_first=first, retained_last=last)
+    output_path.parent.mkdir(parents=True,exist_ok=True)
+    report_path = report_path_for(output_path,'.epoch_repair.json')
+    report_enabled=parse_name(input_path).group('filter').lower() == 'q20'
+    quality_metrics=None  # Screening already completed jointly before task submission.
+    try:
+        if box_config is not None:
+            boxes, reference = box_config
+            process_box_masked_file(input_path, output_path, boxes, reference, overwrite,
+                                   progress_label, numba_threads, quality_metrics, plan['left'])
+        else:
+            _process_filter_file_continuous(input_path, output_path, first, last, overwrite,
+                    progress_label, separate_progress_lines, numba_threads,
+                    plan['inserted'][first:last+1], quality_metrics, frame_indices=plan['left'])
+        with _import_netcdf4().Dataset(output_path,'r+') as ds:
+            selected = slice(first,last+1)
+            flag = ds.createVariable('Frame_Interpolated','u1',('time',),fill_value=False)
+            flag.setncatts(dict(long_name='Frame inserted during Epoch gap repair',
+                flag_values=np.array([0,1],dtype='u1'),
+                flag_meanings='observed interpolated_ancillary_missing_radiance',
+                comment='1: ancillary variables interpolated; Radiance entirely NaN. Excluded from flat-field averaging.',
+                units='1'))
+            flag[:] = plan['inserted'][selected].astype('u1')
+            index = ds.createVariable('Original_Frame_Index','i4',('time',),fill_value=False)
+            index.setncatts(dict(long_name='Zero-based frame index in original L0C input',
+                comment='-1 denotes an inserted gap frame. Indices refer to the source file before duplicate removal or trimming.',
+                units='1'))
+            index[:] = np.where(plan['inserted'][selected],-1,plan['left'][selected]).astype('i4')
+            ds.Epoch_Repair_Source = str(input_path)
+            ds.Epoch_Gap_Policy = 'preserve all gaps; no interpolation'
+            ds.Bad_Frame_Policy = 'Screen all four filters; remove union of rejected original indices before filtering and flat-fielding'
+            ds.Bad_Frames_Removed = int(plan.get('removed_bad_frames', 0))
+            ds.Epoch_Repair = json.dumps(report)
+        report['output_continuity'] = verify_continuity(read_epoch(output_path),plan['cadence'])
+        report['removed_bad_frames'] = plan.get('removed_bad_frames', 0)
+        report['status'] = 'PASS'
+    except Exception as exc:
+        report.update(status='FAILED',error=str(exc))
+        if quality_metrics:
+            try:
+                report['quality_screen'] = write_quality_report(output_path,quality_metrics,plan,first)
+            except Exception as quality_error:
+                report['quality_report_error'] = str(quality_error)
+        raise
+    finally:
+        has_abnormal_frames=report.get('quality_screen',{}).get('frames_review_flagged',0)>0
+        if report_enabled and (report['events'] or has_abnormal_frames):
+            report_path.parent.mkdir(parents=True,exist_ok=True)
+            report_path.write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
+    print(f"{progress_label or input_path.name}: inserted={report['inserted_frames']}, removed duplicates={report['removed_duplicates']}; continuity {report['output_continuity']['continuity']}",flush=True)
+
+
+def save_bad_frame_previews(inputs, rejected, findings, output_dir):
+    """Save original, unfiltered images before any common removal is applied."""
+    if not rejected:
+        return {}
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from contextlib import ExitStack
+    import textwrap
+    folder = output_dir/'reports'/'bad_frames'
+    folder.mkdir(parents=True, exist_ok=True)
+    images = {}
+    with ExitStack() as stack:
+        datasets = {f:stack.enter_context(_import_netcdf4().Dataset(inputs[f])) for f in FILTERS}
+        for index in sorted(rejected):
+            fig, axes = plt.subplots(2, 2, figsize=(12, 11), constrained_layout=True)
+            try:
+                for filt, ax in zip(FILTERS, axes.flat):
+                    raw = _read_image(datasets[filt][RADIANCE_NAME], index)
+                    finite = raw[np.isfinite(raw)]
+                    lo, hi = np.percentile(finite, [1, 99]) if finite.size else (0, 1)
+                    if hi <= lo: hi = lo + max(abs(lo)*0.01, 0.001)
+                    im = ax.imshow(np.ma.masked_invalid(raw), origin='lower', cmap='viridis', vmin=lo, vmax=hi)
+                    reasons = '; '.join(r['reasons'] for r in findings
+                                       if r['filter']==filt and r['original_frame_index']==index)
+                    ax.set_title(filt + '\n' + textwrap.fill(reasons or 'No screening trigger', 48), fontsize=10)
+                    fig.colorbar(im, ax=ax, label='Raw radiance (input units)')
+                    ax.set_xlabel('Detector column'); ax.set_ylabel('Detector row')
+                orbit = parse_name(inputs['q20']).group('orbit')
+                fig.suptitle(f'Orbit {orbit} | original frame {index} (zero-based)\n'
+                             'Removed from all four filters; independent 1-99% display scales', fontsize=13)
+                target = folder/(inputs['q20'].stem + f'_bad_frame_{index:06d}.png')
+                fig.savefig(target, dpi=120)
+                images[index] = str(target)
+            finally:
+                plt.close(fig)
+    return images
+
+
+def screen_all_filters(inputs, plan, output_dir):
+    """One common removal map; comparisons use each filter's own brightness."""
+    screening_start = time.perf_counter()
+    rejected = set()
+    findings = []
+    for filt in FILTERS:
+        metrics = []
+        with _import_netcdf4().Dataset(inputs[filt]) as ds:
+            rad = ds[RADIANCE_NAME]
+            # Read sequential blocks, retaining only the first duplicate occurrence.
+            kept = set(int(i) for i in plan['left'])
+            for start in range(0, plan['original_frames'], RADIANCE_READ_BLOCK_SIZE):
+                stop = min(start + RADIANCE_READ_BLOCK_SIZE, plan['original_frames'])
+                block = _read_image_block(rad, start, stop)
+                geometry = _latitude_valid_mask_block(ds, start, stop, block.shape[1:])
+                for offset, raw in enumerate(block):
+                    if start + offset in kept:
+                        metrics.append(raw_frame_metrics(raw, None if geometry is None else geometry[offset]))
+        for row in quality_rows(metrics, plan, filter_name=filt):
+            if row['review_flag']:
+                rejected.add(row['original_frame_index'])
+                findings.append(dict(row, filter=filt))
+        tolerance = BKG_SCREENING_TOLERANCE if filt == 'bkg' else 1.0
+        print(f"Quality screen {filt}: {sum(r['filter']==filt for r in findings)} flagged frames; "
+              f"temporal tolerance={tolerance:g}x", flush=True)
+    print(f'All-filter screening: {time.perf_counter()-screening_start:.1f}s; '
+          f'{len(rejected)} unique frames rejected', flush=True)
+    preview_start = time.perf_counter()
+    previews = (save_bad_frame_previews(inputs, rejected, findings, output_dir)
+                if SAVE_BAD_FRAME_IMAGES else {})
+    print(f'Bad-frame previews: {time.perf_counter()-preview_start:.1f}s', flush=True)
+    for row in findings:
+        row['image_path'] = previews.get(row['original_frame_index'], '')
+    keep = np.array([int(i) not in rejected for i in plan['left']], dtype=bool)
+    clean = dict(plan)
+    for key in ('left','right','weight','epoch','inserted'):
+        clean[key] = plan[key][keep]
+    clean['events'] = list(plan['events']) + [dict(event='bad_frame', removed_original_index=i,
+        action='removed_from_all_four_filters') for i in sorted(rejected)]
+    clean['removed_bad_frames'] = len(rejected)
+    # Always record screening completion, even when nothing was rejected.
+    target = report_path_for(output_path_for(inputs['q20'], output_dir,
+                          parse_name(inputs['q20']).group('stamp')), '.bad_frames.csv')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fields = ['image_path','filter','screening_status','frames_screened_per_filter','removed_frames_all_filters',
+              'original_frame_index','epoch','reasons','review_flag','action',
+              'adjacent_to_gap','dt_previous_s','dt_next_s','footprint_pixels',
+              'valid_fraction','zero_fraction','saturation_fraction','median_radiance','p99_radiance']
+    with target.open('w', newline='', encoding='utf-8-sig') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore'); writer.writeheader()
+        for row in findings or [dict(filter='all', review_flag=0)]:
+            writer.writerow(dict(row, screening_status='completed',
+                frames_screened_per_filter=len(plan['epoch']), removed_frames_all_filters=len(rejected),
+                action='remove_from_all_four_filters' if findings else 'none'))
+    if not keep.any():
+        raise ValueError('Bad-frame screening rejected every frame; see bad_frames.csv')
+    clean['check'] = verify_continuity(clean['epoch'], clean['cadence'])
+    return clean
 
 
 def _prepare_orbit_tasks(
@@ -1093,16 +1669,60 @@ def _prepare_orbit_tasks(
     output_root: Path,
     mlspb_root: Path,
     selection_mode: str,
-) -> list[tuple[Path, str, str, Path, Path, int, int]]:
+    skip_mlspb: bool = False,
+    mlspb_mode: str = "boxes",
+    min_clean_frames: int = DEFAULT_MIN_CLEAN_FRAMES,
+) -> list[tuple]:
     """Resolve one orbit into four independent file-processing tasks."""
     inputs = matching_l0c_filter_paths(mlspb_q20_path, l0c_root, mlspb_root)
-    flags = read_mlspb_flags(mlspb_q20_path)
-    first, last = select_frame_range(flags, selection_mode)
+    plans = {f:epoch_repair_plan(read_epoch(p)) for f,p in inputs.items()}
+    reference = plans['q20']
+    for filt, plan in plans.items():
+        if (plan['original_frames'] != reference['original_frames'] or
+                not np.array_equal(plan['left'],reference['left']) or
+                not np.array_equal(plan['right'],reference['right']) or
+                not np.allclose(plan['epoch'], reference['epoch'], rtol=0, atol=EPOCH_DUPLICATE_TOLERANCE)):
+            raise ValueError(f'{filt}: Epoch repair pattern differs from q20; cannot align filters safely')
+    if skip_mlspb:
+        flags = np.zeros(reference['original_frames'],dtype=bool)
+    else:
+        flags = read_mlspb_flags(mlspb_q20_path)
+        ml_epoch, source_epoch = read_epoch(mlspb_q20_path), read_epoch(inputs['q20'])
+        if (flags.size != len(source_epoch) or ml_epoch.shape != source_epoch.shape or
+                not np.allclose(ml_epoch,source_epoch,rtol=0,atol=EPOCH_DUPLICATE_TOLERANCE)):
+            raise ValueError('MLSPB timestamps/length do not match the original q20 input; rerun MLSPB on these L0C files')
+    output_dir = (output_root / mlspb_q20_path.parent.relative_to(mlspb_root)
+                  if mlspb_root.is_dir() else output_root)
+    if BAD_FRAME_SCREENING:
+        reference = screen_all_filters(inputs, reference, output_dir)
+    else:
+        print('Bad-frame screening disabled; duplicate removal remains enabled.', flush=True)
+    # Remap MLSPB flags using the shared duplicate + bad-frame removal map.
+    flags = flags[reference['left']]
+    print(f"Epoch repair: {reference['original_frames']} -> {len(flags)} frames; "
+          f"inserted={int(reference['inserted'].sum())}; "
+          f"duplicates removed={sum(e['event']=='duplicate' for e in reference['events'])}; "
+          f"cadence={reference['cadence']:.9f} s; all four filters PASS")
+    box_config = None
+    if not skip_mlspb and mlspb_mode == 'boxes':
+        boxes = read_mlspb_boxes(mlspb_q20_path)[reference['left']]
+        lo, last_trim = select_frame_range(flags, selection_mode)
+        hi = last_trim + 1
+        clean_count = int((~flags[lo:hi]).sum())
+        if clean_count < min_clean_frames:
+            raise ValueError(f'Trim reference contains {clean_count} fully unflagged frames; need {min_clean_frames}')
+        # Preserve even the historical boundary behavior when selection_mode='cxx'.
+        # Excluding flagged reference frames here would change the old flat field.
+        box_config = (boxes, (lo, hi))
+    first, last = ((0,len(flags)-1) if skip_mlspb or box_config is not None
+                   else select_frame_range(flags, selection_mode))
     retained = last - first + 1
-    stamp = adjusted_stamp(inputs["q20"], first)
+    epoch_first = float(reference['epoch'][first])
+    stamp = (datetime(2023,1,1,tzinfo=timezone.utc) +
+             timedelta(seconds=int(np.floor(epoch_first-1356566418.0)))).strftime('%Y%jT%H%M')
     match = parse_name(mlspb_q20_path)
     print(
-        f"Orbit {match.group('orbit')}: retaining frames {first}..{last} "
+        f"Orbit {match.group('orbit')}: retaining repaired frames {first}..{last} "
         f"({retained}/{flags.size}); MLSPB-positive frames={int(flags.sum())}"
     )
     if mlspb_root.is_dir():
@@ -1117,7 +1737,7 @@ def _prepare_orbit_tasks(
         print(f"  {filter_name}: {input_path.name} -> {output_path.name}")
         tasks.append((
             mlspb_q20_path, match.group("orbit"), filter_name,
-            input_path, output_path, first, last,
+            input_path, output_path, first, last, box_config, reference,
         ))
     return tasks
 
@@ -1131,6 +1751,9 @@ def process_orbit_batch(
     overwrite: bool,
     workers: int,
     numba_threads: int = DEFAULT_NUMBA_THREADS,
+    skip_mlspb: bool = False,
+    mlspb_mode: str = "boxes",
+    min_clean_frames: int = DEFAULT_MIN_CLEAN_FRAMES,
 ) -> tuple[list[Path], set[Path]]:
     """Process all filter files from several orbits in one shared pool."""
     tasks = []
@@ -1138,7 +1761,7 @@ def process_orbit_batch(
     for mlspb_q20_path in mlspb_q20_paths:
         try:
             tasks.extend(_prepare_orbit_tasks(
-                mlspb_q20_path, l0c_root, output_root, mlspb_root, selection_mode,
+                mlspb_q20_path, l0c_root, output_root, mlspb_root, selection_mode, skip_mlspb, mlspb_mode, min_clean_frames,
             ))
         except Exception as exc:
             failed_orbits.add(mlspb_q20_path)
@@ -1147,12 +1770,12 @@ def process_orbit_batch(
         return [], failed_orbits
     completed: dict[tuple[Path, str], Path] = {}
     if workers == 1:
-        for orbit_path, orbit, filter_name, input_path, output_path, first, last in tasks:
+        for orbit_path, orbit, filter_name, input_path, output_path, first, last, box_config, shared_plan in tasks:
             label = f"{orbit}/{filter_name}"
             try:
                 process_filter_file(
                     input_path, output_path, first, last, overwrite, label,
-                    False, numba_threads,
+                    False, numba_threads, box_config, shared_plan,
                 )
                 completed[(orbit_path, filter_name)] = output_path
             except Exception as exc:
@@ -1164,19 +1787,19 @@ def process_orbit_batch(
             f"Processing {len(mlspb_q20_paths)} orbit(s), {len(tasks)} files "
             f"with {worker_count} workers"
         )
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=get_context("spawn")) as executor:
             future_to_task = {}
             for task in tasks:
-                orbit_path, orbit, filter_name, input_path, output_path, first, last = task
+                orbit_path, orbit, filter_name, input_path, output_path, first, last, box_config, shared_plan = task
                 label = f"{orbit}/{filter_name}"
                 future = executor.submit(
                     process_filter_file, input_path, output_path, first, last,
-                    overwrite, label, True, numba_threads,
+                    overwrite, label, True, numba_threads, box_config, shared_plan,
                 )
                 future_to_task[future] = task
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
-                orbit_path, orbit, filter_name, _, output_path, _, _ = task
+                orbit_path, orbit, filter_name, _, output_path, _, _, _, _ = task
                 label = f"{orbit}/{filter_name}"
                 try:
                     future.result()
@@ -1186,7 +1809,7 @@ def process_orbit_batch(
                     failed_orbits.add(orbit_path)
                     print(f"ERROR processing {label}: {exc}", file=sys.stderr)
     outputs = []
-    for orbit_path, _, filter_name, _, _, _, _ in tasks:
+    for orbit_path, _, filter_name, _, _, _, _, _, _ in tasks:
         output_path = completed.get((orbit_path, filter_name))
         if output_path is not None:
             outputs.append(output_path)
@@ -1292,10 +1915,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--numba-threads", type=int, default=DEFAULT_NUMBA_THREADS,
         help=f"Numba threads per worker (default: {DEFAULT_NUMBA_THREADS}).",
     )
+    parser.add_argument('--gap-treatment',choices=('leave',),default='leave',
+                        help='Compatibility option: gaps are always left unchanged.')
+    parser.add_argument("--skip-mlspb", action="store_true",
+                        help="Isolated L0C test: keep the full repaired orbit, without MLSPB trimming.")
     parser.add_argument(
         "--self-test", action="store_true",
         help="Test numerical processing functions without opening NetCDF files.",
     )
+    parser.add_argument('--mlspb-mode', choices=('boxes', 'trim'), default=DEFAULT_MLSPB_MODE,
+                        help='boxes: preserve legacy trim result and extend with its flat field; trim: legacy behavior')
+    parser.add_argument('--min-clean-frames', type=int, default=DEFAULT_MIN_CLEAN_FRAMES,
+                        help='Minimum fully unflagged frames within the legacy trim reference interval')
     return parser
 
 
@@ -1305,6 +1936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         run_self_test()
         return 0
+    if args.min_clean_frames < 1: raise SystemExit('--min-clean-frames must be positive')
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
     if args.orbits_at_a_time < 1:
@@ -1317,6 +1949,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_l0c_input = args.l0c_input or (
         Path(DEFAULT_L0C_INPUT) if DEFAULT_L0C_INPUT else None
     )
+    if args.skip_mlspb:
+        selected_mlspb_input = args.mlspb_input or selected_l0c_input
+        print('TEST MODE: MLSPB trimming disabled; retaining the full repaired orbit.',flush=True)
     selected_output = args.output or (Path(DEFAULT_OUTPUT) if DEFAULT_OUTPUT else None)
     if selected_mlspb_input is None or selected_l0c_input is None or selected_output is None:
         raise SystemExit(
@@ -1356,6 +1991,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             overwrite=args.overwrite,
             workers=args.workers,
             numba_threads=args.numba_threads,
+            skip_mlspb=args.skip_mlspb,
+            mlspb_mode=args.mlspb_mode, min_clean_frames=args.min_clean_frames,
         )
         all_outputs.extend(batch_outputs)
         failed_orbits.update(batch_failures)

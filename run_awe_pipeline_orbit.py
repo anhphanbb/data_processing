@@ -49,7 +49,9 @@ START_STEP = 0  # 0: copy/remove glare; 1: existing L0C; 2: existing L0C + L0D
 WORKERS = 4     # Parallel filters WITHIN one orbit
 RESOLUTIONS = (2, 10)
 # Change these only for scientific options, not input/output paths or mode.
-EXTRA_ARGS = {2: [], 3: [], 5: [], 6: []}
+MLSPB_MODE = 'boxes'  # 'trim' restores legacy frame trimming
+MIN_CLEAN_FRAMES = 100
+EXTRA_ARGS = {2: ['--mlspb-mode', MLSPB_MODE, '--min-clean-frames', str(MIN_CLEAN_FRAMES)], 3: [], 5: [], 6: []}
 # -----------------------------------------------------------------
 FILTERS = ('q20', 'p12', 'p14', 'bkg')
 LEVELS = ('l0c','l0d','l1f','l1r','l1c','l1a','l2a','l3a','l3c')
@@ -349,7 +351,8 @@ def fingerprint(group, args):
     payload = {'inputs':[(str(p.resolve()),p.stat().st_size,p.stat().st_mtime_ns)
                           for p in sorted(group.values())],
                'settings':[args.start_step,args.save_l0c,args.save_l0d,args.save_l1f,args.save_l1r,args.workers,
-                           RESOLUTIONS,EXTRA_ARGS,str(PYTHON_EXE),str(ML_PYTHON_EXE)],
+                           RESOLUTIONS,EXTRA_ARGS,str(PYTHON_EXE),str(ML_PYTHON_EXE),
+                           getattr(args,'step_workers',{})],
                'scripts':[(str(Path(p).resolve()),hashlib.sha256(Path(p).read_bytes()).hexdigest())
                           for p in [Path(__file__),*[SCRIPTS[s] for s in range(args.start_step,7)]]]}
     if args.start_step == 0:

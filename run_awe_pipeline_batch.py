@@ -5,7 +5,10 @@ Keep run_awe_pipeline_orbit.py, 0_copy_and_remove_glare.py and the four processi
 from __future__ import annotations
 import argparse
 import copy
-from concurrent.futures import ThreadPoolExecutor
+import csv
+import os
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import queue
 import threading
 from datetime import datetime
 import hashlib
@@ -51,18 +54,24 @@ PYTHON_EXE = sys.executable
 ML_PYTHON_EXE = sys.executable
 ORBITS_AT_A_TIME = 5
 PREFETCH_STEP0 = True  # Prepare one next batch during current steps 1-6
-WORKERS = 20  # Total file workers for the batch, not 20 per orbit
+OVERLAP_BATCHES = True
+MAX_PROCESSING_BATCHES = 3  # Plus at most one preparing/prepared batch
+WORKERS = 20  # Fallback file workers per CPU stage, not per orbit
+# None inherits WORKERS / --workers. Tune one stage at a time.
+STEP_WORKERS = {2: None, 3: None, 5: None, 6: None}
 L0C_SOURCE_ROOT = Path(r'Y:\soc\l0c\version02')
 GLARE_CSV = Path(r"D:\Github\solar_panels\csv\IndividualMonths\glare_intervals_Nov2023.csv")  # None: SCRIPT_DIR/csv/IndividualMonths/glare_intervals_MonYYYY.csv
-SAVE_L0C = False  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
+SAVE_L0C = True  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
 SAVE_L0D = False
-SAVE_L1F = True
+SAVE_L1F = False
 SAVE_L1R = False
 CONTINUE_ON_ERROR = True
 OVERWRITE = True  # Set True to reprocess and replace matching outputs
-START_STEP = 1  # 0: copy/remove glare; 1: existing L0C; 2: existing L0C + L0D
+START_STEP = 0  # 0: copy/remove glare; 1: existing L0C; 2: existing L0C + L0D
 RESOLUTIONS = (2,10)
-EXTRA_ARGS = {2:[],3:[],5:[],6:[]}
+MLSPB_MODE = 'boxes'  # 'trim' restores legacy frame trimming
+MIN_CLEAN_FRAMES = 100  # Minimum reference interval; tune after validation
+EXTRA_ARGS = {2:['--mlspb-mode', MLSPB_MODE, '--min-clean-frames', str(MIN_CLEAN_FRAMES)],3:[],5:[],6:[]}
 # -----------------------------------------------------------------
 
 
@@ -72,7 +81,8 @@ def configure_core():
 
 
 def command_for(step, paths, args, orbit_count):
-    command = core.make_command(step,paths,args.workers)
+    workers = getattr(args, "step_workers", {}).get(step, args.workers)
+    command = core.make_command(step,paths,workers)
     if step == 2:
         # The flat-field script has its own batch-size flag. It must match the
         # outer batch or only four tasks at a time would be submitted.
@@ -102,6 +112,49 @@ def relocate_orbit(source_paths, target_paths, orbit):
     for src,dst in pairs:
         dst.parent.mkdir(parents=True,exist_ok=True)
         src.rename(dst)
+
+
+# In-memory all-filter findings survive intermediate-file cleanup.
+QUALITY_RESULTS = {}
+
+
+def collect_quality(paths, jobs):
+    for job in jobs:
+        orbit = job['orbit']
+        reports = [p for p in orbit_files(paths['l1f'], orbit)
+                   if p.name.endswith('.bad_frames.csv')]
+        if reports:
+            rows = []
+            for report in reports:
+                with report.open(newline='', encoding='utf-8-sig') as stream:
+                    rows.extend(csv.DictReader(stream))
+            # Archive previews before retries, failures or workspace cleanup.
+            run_root = Path(job['record']['logs']).parents[2]
+            for row in rows:
+                source = Path(row['image_path']) if row.get('image_path') else None
+                if source is not None and source.is_file():
+                    target = run_root/'bad_frames'/source.name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                    row['image_path'] = str(target)
+            QUALITY_RESULTS[orbit] = rows
+
+
+def write_run_quality(run_logs, records):
+    fields = ['orbit','image_path','pipeline_status','filter','screening_status',
+              'frames_screened_per_filter','removed_frames_all_filters',
+              'original_frame_index','epoch','reasons','review_flag','action',
+              'adjacent_to_gap','dt_previous_s','dt_next_s','footprint_pixels',
+              'valid_fraction','zero_fraction','saturation_fraction','median_radiance','p99_radiance']
+    target = run_logs/'frame_quality_all_orbits.csv'
+    temporary = target.with_suffix('.csv.partial')
+    with temporary.open('w', newline='', encoding='utf-8-sig') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore'); writer.writeheader()
+        for record in records:
+            rows = QUALITY_RESULTS.get(record['orbit']) or [dict(filter='all', screening_status='not_confirmed')]
+            for row in rows:
+                writer.writerow(dict(row, orbit=record['orbit'], pipeline_status=record['status']))
+    os.replace(temporary, target)
 
 
 def cleanup_after(step, paths, orbit, args):
@@ -142,8 +195,28 @@ def save_products(paths, permanent, job, args, logdir):
         for p in orbit_files(folder,orbit): p.unlink()
 
 
-def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
-    """One child per stage; on failure retry that stage per orbit in isolation."""
+def isolate_previous_outputs(step, paths, orbit, archive):
+    """Start with empty per-orbit stage outputs; preserve old attempts for diagnosis.
+
+    Empty destinations prove that validated products came from this invocation.
+    Step 6's master grid is an INPUT and must remain in l1r.
+    """
+    levels = {1: ('l0d',), 2: ('l1f',), 3: ('l1r',), 4: ('l1c',),
+              5: ('l1a',), 6: ('l2a', 'l3a', 'l3c')}[step]
+    moved = 0
+    for level in levels:
+        for source in orbit_files(paths[level], orbit):
+            target = archive / orbit / level / source.relative_to(paths[level])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise FileExistsError(f'Previous-attempt archive already exists: {target}')
+            source.rename(target)
+            moved += 1
+    return moved
+
+
+def process_batch_steps(jobs, args, permanent, work, batch_logs, checkpoint):
+    """Validate fresh outputs per orbit; retry only missing/invalid products."""
     paths = paths_in(work/'active')
     for p in paths.values(): p.mkdir(parents=True,exist_ok=True)
     batch_logs.mkdir(parents=True,exist_ok=True)
@@ -165,6 +238,7 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
         checkpoint()
 
     def fail(job, exc, source_paths=paths):
+        collect_quality(source_paths, [job])
         target = paths_in(work/'failed'/job['orbit'])
         relocate_orbit(source_paths,target,job['orbit'])
         job['record'].update(status='failed',error=f'{type(exc).__name__}: {exc}',
@@ -174,6 +248,8 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
         if not args.continue_on_error: raise exc
 
     try:
+        # Setup must not queue behind heavy CPU stages before GPU work can start.
+        yield ('setup', 'setup')
         for job in jobs:
             if job['record']['status'] == 'failed': continue
             job['record'].update(status='running',work=str(work/'active'),logs=str(log_for(job)))
@@ -190,37 +266,66 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
         update()
         for step in range(max(1,args.start_step),7):
             if not active: break
+            waiting_since = time.perf_counter()
+            resource = 'gpu' if step in (1,4) else 'cpu'
+            yield (resource, step)
+            wait_seconds = time.perf_counter()-waiting_since
             print(f'\nBatch {batch_logs.name}, step {step}: {core.LABELS[step]}; orbits '+
                   ', '.join(j['orbit'] for j in active),flush=True)
             tick = time.perf_counter()
             batch_error = None
+            archived = sum(isolate_previous_outputs(
+                step, paths, job['orbit'], work/'previous_attempts'/f'step_{step}'/'batch')
+                for job in active)
+            validation_seconds = 0.0
+            retry_seconds = 0.0
+            retry_count = 0
+            reused_after_batch_error = []
+            validation_failures = []
+            process_tick = time.perf_counter()
             try:
                 core.check_inputs(step,paths)
                 core.run_logged(command_for(step,paths,args,len(active)),Path(SCRIPTS[step]).resolve().parent,
                                 batch_logs/f'step_{step}.log')
+            except core.PreparationCancelled:
+                raise
             except Exception as exc:
                 batch_error = exc
                 print(f'Batch step reported: {exc}',flush=True)
                 if not args.continue_on_error: raise
-            stage = {'step':step,'batch_process_seconds':round(time.perf_counter()-tick,2),
+            process_seconds = time.perf_counter()-process_tick
+            if step == 2: collect_quality(paths, active)
+            stage = {'step':step,'resource':resource,'resource_wait_seconds':round(wait_seconds,2),'batch_process_seconds':round(process_seconds,2),
+                     'workers':getattr(args, 'step_workers', {}).get(step,args.workers) if step not in (1,4) else None,
+                     'archived_previous_files':archived,
                      'orbits':[j['orbit'] for j in active]}
             if batch_error: stage['error'] = f'{type(batch_error).__name__}: {batch_error}'
             stage_records.append(stage)
             survivors = []
             for job in active:
                 orbit = job['orbit']
-                error = batch_error
+                error = None
                 retried = False
-                if error is None:
-                    try:
-                        if step == 4: core.normalize_mlcloud_output(paths,orbit)
-                        core.validate_outputs(step,paths,orbit,log_for(job))
-                    except Exception as exc: error = exc
+                validation_tick = time.perf_counter()
+                try:
+                    if step == 4: core.normalize_mlcloud_output(paths,orbit)
+                    core.validate_outputs(step,paths,orbit,log_for(job))
+                except core.PreparationCancelled:
+                    raise
+                except Exception as exc:
+                    error = exc
+                    validation_failures.append({'orbit':orbit, 'error':f'{type(exc).__name__}: {exc}'})
+                finally:
+                    validation_seconds += time.perf_counter()-validation_tick
+                if error is None and batch_error is not None:
+                    reused_after_batch_error.append(orbit)
+                    print(f'Orbit {orbit}: fresh outputs validated; no retry needed.',flush=True)
                 if error is not None:
                     if not args.continue_on_error: raise error
-                    # A batch error can prevent otherwise good orbits reaching
-                    # later substages (e.g. L2A failure before L3A). Retry all
-                    # affected orbits once with only their own files visible.
+                    # expected_outputs checks ALL required products, including every
+                    # Step 6 resolution. Retry only this incomplete/invalid orbit.
+                    retry_tick = time.perf_counter()
+                    retry_count += 1
                     retry_root = work/'retry'/orbit
                     retry_paths = paths_in(retry_root)
                     for p in retry_paths.values(): p.mkdir(parents=True,exist_ok=True)
@@ -231,14 +336,21 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
                     retried = True
                     job['record'].setdefault('retries',[]).append({'step':step,'reason':str(error),'logs':str(retry_logs)})
                     try:
+                        isolate_previous_outputs(step,retry_paths,orbit,
+                            work/'previous_attempts'/f'step_{step}'/'retry')
                         core.check_inputs(step,retry_paths)
                         core.run_logged(command_for(step,retry_paths,args,1),Path(SCRIPTS[step]).resolve().parent,
                                         retry_logs/f'step_{step}.log')
                         if step == 4: core.normalize_mlcloud_output(retry_paths,orbit)
                         core.validate_outputs(step,retry_paths,orbit,retry_logs)
+                    except core.PreparationCancelled:
+                        raise
                     except Exception as exc:
                         fail(job,exc,retry_paths)
                         continue
+                    finally:
+                        retry_seconds += time.perf_counter()-retry_tick
+                    if step == 2: collect_quality(retry_paths, [job])
                     relocate_orbit(retry_paths,paths,orbit)
                     shutil.rmtree(retry_root)
                 job['record']['steps'].append({'step':step,'validated':True,'retried':retried,
@@ -246,6 +358,10 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
                 cleanup_after(step,paths,orbit,args)
                 survivors.append(job)
             active = survivors
+            stage.update(validation_seconds=round(validation_seconds,2),
+                         retry_seconds=round(retry_seconds,2), retry_count=retry_count,
+                         retained_after_batch_error=reused_after_batch_error,
+                         validation_failures=validation_failures)
             stage['stage_total_seconds'] = round(time.perf_counter()-tick,2)
             # Preserve timing/error CSVs before workspace cleanup, including L2A subfolders.
             for level,folder in paths.items():
@@ -254,6 +370,7 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
                     dst.parent.mkdir(parents=True,exist_ok=True)
                     shutil.copy2(report,dst)
             update()
+        yield ('cpu', 'save')
         for job in active:
             try:
                 save_products(paths,permanent,job,args,log_for(job))
@@ -264,7 +381,7 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
     except BaseException as exc:
         for job in jobs:
             if job['record']['status'] in ('pending','running'):
-                job['record'].update(status='interrupted' if not isinstance(exc,Exception) else 'aborted',
+                job['record'].update(status='interrupted' if isinstance(exc,(core.PreparationCancelled,KeyboardInterrupt,GeneratorExit)) else 'aborted',
                                      error=f'{type(exc).__name__}: {exc}',work=str(work))
         raise
     finally:
@@ -273,6 +390,12 @@ def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
         shutil.rmtree(work)
     else:
         print(f'Failed-orbit temporary data retained under {work}',flush=True)
+
+
+def process_batch(jobs, args, permanent, work, batch_logs, checkpoint):
+    # Compatibility path: execute the same stages serially.
+    for _ in process_batch_steps(jobs,args,permanent,work,batch_logs,checkpoint):
+        pass
 
 
 def prepare_batch(batch, args, stop):
@@ -327,7 +450,7 @@ def merge_preparation(batch, result):
     return error
 
 
-def run_batches(batches, args, permanent, checkpoint):
+def run_batches_serial(batches, args, permanent, checkpoint):
     """One consumer plus at most one ahead-of-consumer preparation batch."""
     batches = iter(batches)
     if args.start_step != 0 or not args.prefetch_step0:
@@ -371,6 +494,158 @@ def run_batches(batches, args, permanent, checkpoint):
         checkpoint()
 
 
+def run_batches(batches, args, permanent, checkpoint):
+    """Central dispatcher: one preparation, setup, GPU and CPU task at a time.
+
+    Worker-owned records are copied into a queue. Only the dispatcher updates
+    the global summary records, avoiding concurrent JSON serialization/mutation.
+    A CPU/GPU reservation covers the stage's retries, validation and cleanup.
+    """
+    if not args.overlap_batches:
+        return run_batches_serial(batches,args,permanent,checkpoint)
+    batches = iter(batches)
+    stop = threading.Event()
+    snapshots = queue.Queue()
+    originals = {}
+    states = []
+    running = {}
+    pending = None
+    exhausted = False
+    timeline = []
+    run_root = None
+    origin = time.perf_counter()
+    executor = ThreadPoolExecutor(max_workers=4,thread_name_prefix='awe-scheduler')
+
+    def merge_snapshots():
+        changed = False
+        while True:
+            try: key, records = snapshots.get_nowait()
+            except queue.Empty: break
+            for job, record in zip(originals[key][0],records):
+                job['record'].clear(); job['record'].update(record)
+            changed = True
+        if changed: checkpoint()
+
+    def save_timeline():
+        if run_root is None: return
+        target = run_root/'scheduler_timing.json'
+        temporary = target.with_suffix('.json.partial')
+        temporary.write_text(json.dumps({'elapsed_seconds':round(time.perf_counter()-origin,3),
+            'max_processing_batches':args.max_processing_batches,
+            'resource_limits':{'prepare':1,'setup':1,'gpu':1,'cpu':1},'tasks':timeline},indent=2),encoding='utf-8')
+        os.replace(temporary,target)
+
+    def advance(state):
+        core.LOG_CONTEXT.stop_event = stop
+        try:
+            if stop.is_set(): raise core.PreparationCancelled('Scheduler stopped')
+            try: return next(state['generator'])
+            except StopIteration: return None
+        finally:
+            del core.LOG_CONTEXT.stop_event
+
+    def record_task(resource, batch, step, waiting=0):
+        item = dict(batch=batch[2].name,resource=resource,step=step,
+                    wait_seconds=round(waiting,3),started_seconds=round(time.perf_counter()-origin,3),status='running')
+        timeline.append(item)
+        print(f'[scheduler] {batch[2].name}: {resource} {step}',flush=True)
+        return item
+
+    try:
+        while True:
+            merge_snapshots()
+            # Finish resource tasks before dispatching any replacements.
+            for future in list(running):
+                if not future.done(): continue
+                info = running.pop(future)
+                item = info['timing']
+                item['finished_seconds'] = round(time.perf_counter()-origin,3)
+                item['elapsed_seconds'] = round(item['finished_seconds']-item['started_seconds'],3)
+                try:
+                    result = future.result()
+                    if info['resource'] == 'prepare':
+                        error = merge_preparation(info['batch'],result)
+                        checkpoint()
+                        if error is not None: raise error
+                        pending['ready'] = True
+                    else:
+                        state = info['state']; state['request'] = result
+                        state['ready_since'] = time.perf_counter()
+                        if result is None: states.remove(state)
+                    item['status'] = 'completed'
+                except BaseException as exc:
+                    item.update(status='failed',error=f'{type(exc).__name__}: {exc}')
+                    raise
+            merge_snapshots()
+            # Admit oldest prepared batch. At most N processing plus one prepared.
+            if pending is not None and pending['ready'] and len(states)<args.max_processing_batches:
+                batch = pending['batch']; pending = None
+                local_jobs = copy.deepcopy(batch[0]); key = str(batch[1])
+                def publish(jobs=local_jobs, k=key):
+                    snapshots.put((k,copy.deepcopy([j['record'] for j in jobs])))
+                state = dict(batch=batch,ready_since=time.perf_counter(),request=None)
+                state['generator'] = process_batch_steps(local_jobs,args,permanent,batch[1],batch[2],publish)
+                # Prime only: the first yield precedes all stage work.
+                state['request'] = next(state['generator'])
+                states.append(state)
+            # Never prefetch more than one batch; generator selection stays on this thread.
+            prefetch_allowed = args.prefetch_step0 or len(states)<args.max_processing_batches
+            if pending is None and not exhausted and prefetch_allowed:
+                batch = next(batches,None)
+                if batch is None:
+                    exhausted = True
+                else:
+                    originals[str(batch[1])] = batch
+                    run_root = batch[2].parent; run_root.mkdir(parents=True,exist_ok=True)
+                    for job in batch[0]:
+                        job['record'].update(status='prefetching',work=str(batch[1]/'active'),
+                                             logs=str(batch[2]/'orbits'/job['orbit']))
+                    checkpoint()
+                    pending = dict(batch=batch,ready=False)
+                    item = record_task('prepare',batch,0 if args.start_step==0 else 'input_copy')
+                    future = executor.submit(prepare_batch,batch,args,stop)
+                    running[future] = dict(resource='prepare',batch=batch,timing=item)
+            busy = {info['resource'] for info in running.values()}
+            active_ids = {id(info['state']) for info in running.values() if 'state' in info}
+            for resource in ('setup','gpu','cpu'):
+                if resource in busy: continue
+                # States remain in admission order: oldest ready batch wins.
+                state = next((s for s in states if id(s) not in active_ids and
+                              s['request'] is not None and s['request'][0]==resource),None)
+                if state is None: continue
+                item = record_task(resource,state['batch'],state['request'][1],
+                                   time.perf_counter()-state['ready_since'])
+                future = executor.submit(advance,state)
+                running[future] = dict(resource=resource,state=state,timing=item)
+                busy.add(resource)
+            save_timeline()
+            if exhausted and pending is None and not states and not running: break
+            if running:
+                wait(tuple(running),timeout=0.25,return_when=FIRST_COMPLETED)
+    finally:
+        stop.set()
+        # run_logged sees this event and terminates its full child process tree.
+        executor.shutdown(wait=True,cancel_futures=True)
+        for future, info in running.items():
+            if future.cancelled(): continue
+            try:
+                result = future.result()
+                if info['resource']=='prepare': merge_preparation(info['batch'],result)
+                info['timing']['status']='completed'
+            except BaseException as exc:
+                info['timing'].update(status='interrupted',error=f'{type(exc).__name__}: {exc}')
+            info['timing']['finished_seconds']=round(time.perf_counter()-origin,3)
+            info['timing']['elapsed_seconds']=round(info['timing']['finished_seconds']-info['timing']['started_seconds'],3)
+        for state in states:
+            state['generator'].close()
+        merge_snapshots()
+        checkpoint()
+        save_timeline()
+        if run_root is not None:
+            print(f'Scheduler timing: {run_root / "scheduler_timing.json"}',flush=True)
+            print(f'Scheduler elapsed: {time.perf_counter()-origin:.1f}s (includes preparation and saving)',flush=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--year',type=int,default=YEAR)
@@ -384,6 +659,11 @@ def main(argv=None):
     p.add_argument('--limit',type=int,help='Maximum pending orbit attempts, including failures')
     p.add_argument('--orbits-at-a-time','--batch-size',dest='orbits_at_a_time',type=int,default=ORBITS_AT_A_TIME)
     p.add_argument('--workers',type=int,default=WORKERS)
+    for step in (2,3,5,6):
+        p.add_argument(f'--step-{step}-workers',type=int,default=STEP_WORKERS[step],
+                       help=f'File workers for step {step}; default inherits --workers')
+    p.add_argument('--overlap-batches',action=argparse.BooleanOptionalAction,default=OVERLAP_BATCHES)
+    p.add_argument('--max-processing-batches',type=int,default=MAX_PROCESSING_BATCHES)
     p.add_argument('--prefetch-step0',action=argparse.BooleanOptionalAction,default=PREFETCH_STEP0)
     p.add_argument('--start-step',type=int,choices=(0,1,2),default=START_STEP)
     for name,value in [('save-l0d',SAVE_L0D),('save-l1f',SAVE_L1F),('save-l1r',SAVE_L1R),
@@ -395,6 +675,12 @@ def main(argv=None):
     if not 1 <= args.month <= 12 or not 1 <= args.year <= 9999: p.error('Invalid year/month')
     if min(args.workers,args.orbits_at_a_time) < 1 or (args.limit is not None and args.limit < 1):
         p.error('workers, orbits-at-a-time and limit must be positive')
+    args.step_workers = {step: (getattr(args,f'step_{step}_workers')
+                               if getattr(args,f'step_{step}_workers') is not None else args.workers)
+                         for step in (2,3,5,6)}
+    if any(value < 1 for value in args.step_workers.values()):
+        p.error('Per-stage workers must be positive')
+    if args.max_processing_batches < 1: p.error('max-processing-batches must be positive')
     if args.orbits and any(o < 0 or o > 99999 for o in args.orbits): p.error('Orbit must be 0..99999')
     configure_core()
     args.soc_root = args.soc_root.expanduser().resolve()
@@ -404,7 +690,10 @@ def main(argv=None):
     work_root = (args.work_root or args.soc_root/'_orbit_work').expanduser().resolve()
     print(f'Batch size={args.orbits_at_a_time}; total file workers={args.workers}; '
           f'save L0C/L0D/L1F/L1R={args.save_l0c}/{args.save_l0d}/{args.save_l1f}/{args.save_l1r}',flush=True)
+    print(f'CPU file workers by step: {args.step_workers}',flush=True)
     print(f'Step 0 prefetch: {args.prefetch_step0 and args.start_step == 0} (at most one next batch)',flush=True)
+    print(f'Stage overlap={args.overlap_batches}; processing batches={args.max_processing_batches}; '
+          'GPU slots=1; CPU slots=1; preparation slots=1; setup slots=1',flush=True)
     if args.dry_run:
         selected = list(groups)[:args.limit]
         for start in range(0,len(selected),args.orbits_at_a_time):
@@ -425,7 +714,12 @@ def main(argv=None):
     run_logs = args.soc_root/'pipeline_logs'/f'{args.year:04d}'/f'{args.month:02d}'/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     run_logs.mkdir(parents=True,exist_ok=True)
     records = []
-    def checkpoint(): (run_logs/'summary.json').write_text(json.dumps(records,indent=2),encoding='utf-8')
+    QUALITY_RESULTS.clear()
+    checkpoint_lock = threading.Lock()
+    def checkpoint():
+        with checkpoint_lock:
+            (run_logs/'summary.json').write_text(json.dumps(records,indent=2),encoding='utf-8')
+            write_run_quality(run_logs, records)
     def selected_batches():
         pending = []
         attempted = 0
@@ -486,6 +780,7 @@ def main(argv=None):
         print(f'Finished: {completed} completed; {len(failed)} failed/aborted; {skipped} skipped.',flush=True)
         if failed: print('Failed/aborted orbits: '+', '.join(failed),flush=True)
         print(f'Run summary: {run_logs/"summary.json"}',flush=True)
+        print(f'Frame quality report: {run_logs/"frame_quality_all_orbits.csv"}',flush=True)
     return 1 if failed else 0
 
 

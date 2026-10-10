@@ -1,3 +1,211 @@
+# AWE pipeline: selective retries and three-batch scheduling
+
+Replace both runners together: `run_awe_pipeline_batch.py` and
+`run_awe_pipeline_orbit.py`. The other five Python scripts in this package are
+unchanged copies of your supplied versions. Keep their canonical filenames.
+Step 0, MLSPB and MLCloud scripts/models remain external at the paths in SCRIPTS.
+
+Review YEAR, MONTH, SOC_ROOT, GLARE_CSV and save flags before running. The supplied
+YEAR=2023, MONTH=11, SAVE_L0C=True and OVERWRITE=True are preserved.
+OVERWRITE=True replaces matching saved outputs. This is an opt-in run, not a
+measured speedup: benchmark the same inputs before choosing permanent settings.
+
+## Defaults and per-stage workers
+
+```python
+OVERLAP_BATCHES = True
+MAX_PROCESSING_BATCHES = 3
+ORBITS_AT_A_TIME = 10
+PREFETCH_STEP0 = True
+WORKERS = 20
+STEP_WORKERS = {2: None, 3: None, 5: None, 6: None}
+```
+
+None inherits WORKERS / --workers. For example, set STEP_WORKERS[2] = 12 to
+use 12 file workers for filtering. No unmeasured worker reduction is enabled
+by default. The command-line equivalent is:
+
+```text
+python run_awe_pipeline_batch.py --workers 20 --step-2-workers 12 --step-3-workers 8
+```
+
+Use --step-5-workers and --step-6-workers for coadding and final products.
+Per-stage worker settings are included in completion fingerprints.
+
+There is still only one CPU stage, one ML stage, one setup task and one
+preparation task at a time. Three batches may be processing, plus at most one
+preparing/prepared batch. This needs more temporary storage than two batches.
+The ML processes still load their models per batch; persistent models and
+compression changes are not part of this revision.
+
+To compare with the previous admission limit:
+
+```text
+python run_awe_pipeline_batch.py --max-processing-batches 2
+```
+
+--no-overlap-batches retains sequential batch execution with optional Step 0
+prefetch. Oldest ready batches retain priority. Preparation can still use CPU
+and disk while a CPU stage runs. The scheduler's CPU slot is not hardware CPU
+utilization. Workspaces remain isolated per batch.
+
+## Selective retries
+
+A failed batch subprocess no longer automatically retries every orbit.
+The runner checks each orbit's complete required output set. Valid fresh
+outputs continue; missing or invalid outputs trigger one isolated retry of
+that orbit's stage. Step 6 checks every configured L2A/L3A resolution and L3C.
+A successful exit with invalid outputs also triggers a retry.
+
+Before each batch or retry attempt, any existing stage outputs for that orbit
+are moved into `previous_attempts/step_N/batch/` or `previous_attempts/step_N/retry/`
+inside the batch workspace. This includes partial files and alternate ML output
+names. Stage output directories therefore start empty for that orbit: stale
+products cannot satisfy validation. Step 6 retains its input master grid.
+The files are moved, not copied, and are preserved for diagnosis if the batch
+fails or is interrupted. They are removed with the workspace when the entire
+batch completes. Partial retry outputs still require space until then.
+
+The existing validation checks required variables, nonempty arrays, readable
+endpoints and master-grid structure. It does not perform a full scientific
+quality audit of every pixel. Scientific screening and formulas are unchanged.
+Fail-fast and cancellation behavior are preserved.
+
+## Timing
+
+`scheduler_timing.json` still records total wall time, stage resource waits and
+task durations. Each `batch_status.json` stage now records:
+
+- batch_process_seconds: initial input check and subprocess duration.
+- validation_seconds: initial per-orbit output validation and MLCloud renaming.
+- retry_seconds: isolated retry work, including its validation and failure handling.
+- retry_count and validation_failures.
+- retained_after_batch_error: orbits accepted without repeating the stage.
+- archived_previous_files: files isolated before the initial attempt.
+- workers: resolved CPU stage worker count (null for ML stages).
+- stage_total_seconds: stage execution through orbit cleanup, before report
+  archiving and the final status write.
+
+These durations do not separate model startup from inference. Other overhead
+means the timing components need not sum exactly to the stage total.
+A completed scheduler task can contain individual orbit failures; summary.json
+remains authoritative. Do not sum overlapping task durations as wall time.
+
+## Validation performed for this revision
+
+Python compilation and eight simulated tests passed: mixed batch success/failure,
+stale-output isolation, partial Step 6 output, corrupt output despite exit zero,
+persistent retry failure, cancellation, fail-fast behavior, and worker settings
+including CLI parsing. Run the bundled checks with:
+
+```text
+python tests/test_runner_update.py
+```
+
+The tests simulate processing and file validation; they do not run TensorFlow,
+real NetCDF processing, or the Windows data paths. Full data validation and timing
+must be done on your machine. No scientific processing script was modified.
+
+---
+
+# AWE boxes mode: preserve trim, then extend
+
+This revision replaces the previous longest-clean-interval flat-field method.
+It first runs the ORIGINAL trim algorithm on the original selected trim interval.
+It captures that exact flat field, copies the processed trim Radiance into the
+longer output, and computes only the extra frames using the captured flat field.
+
+## What is preserved
+
+For the same L0C inputs, duplicate handling, selection mode and numerical engine,
+L1F Radiance within the trim interval is copied exactly, with one explicit
+exception: MLSPB-flagged detector boxes are set to NaN. All other values, including
+existing NaNs, remain the same. No filtering, normalization or quantization is
+repeated on those copied values. Coordinates and timestamps come from the same
+original frames. Synthetic tests compare all four filters with exact equality,
+not a numeric tolerance.
+
+The calibration is the original arithmetic: original image filtering, original
+zero handling, original number-of-frames denominator, accumulation order and
+central normalization. Masked-frame processing and valid-sample averaging are
+NOT substituted into that calculation. The flat field is frozen during extension.
+
+`--selection-mode cxx` (default) reproduces historical trim boundaries, including
+any MLSPB-positive boundary or internal frames that the original trim selection
+retains. These also contribute to the original flat field, intentionally: dropping
+them would change the baseline. If you choose `--selection-mode clean`, use it for
+BOTH trim and boxes comparisons. That option trims flagged ends, not internal
+flagged frames. This revision preserves a baseline; it does not assert that the
+legacy calibration is scientifically optimal.
+
+## Extra frames
+
+Only frames outside the original trim interval use the mask-aware bright/dark
+filter and normalization. Flagged boxes are excluded from their calculations.
+The original flat field is used unchanged. The valid central 20x20 region sets
+the scale; if it has no usable pixels, the valid footprint supplies the fallback.
+Unsupported pixels remain NaN. No temporal interpolation or gap filling is added.
+
+## Settings
+
+Keep `MLSPB_MODE = 'boxes'` in the runner; use `'trim'` for a baseline run.
+`MIN_CLEAN_FRAMES = 100` / `--min-clean-frames` is retained as a compatibility
+setting. It now means a minimum count of fully unflagged frames INSIDE the original
+trim interval. It does not select a different interval, split at gaps, or change
+the flat-field denominator. The minimum is an operational guard, not a calibrated
+scientific threshold.
+
+## Files to replace
+
+Replace these scientific scripts together:
+- filter_flatfield_to_1lf.py
+- regrid_l1f_to_l1r.py
+- coadd_to_l1a.py
+- generate_l2a_l3a_l3c.py
+- 4_and_5_mlcloud.py (at the path used by step 4, normally
+  D:\Github\cloud_restructured\4_and_5_mlcloud.py)
+
+Only flat-field processing changes numerically in this revision. The other four
+scripts now also recognize `MLSPB_Mask_Mode = boxes_trim_reference` and retain
+the previously added missing-data handling. They also recognize the older
+`boxes_clean_reference` products. Both runners are included unchanged; keep your
+own month/path settings and models. Existing step-0 glare and MLSPB models remain
+external. Re-run from step 2 with matching L0C/L0D, or run the full pipeline.
+Use separate output trees for comparisons; longer filenames/timestamps may leave
+old differently named products alongside new ones if you reuse a folder.
+
+## Diagnostics and limits
+
+`Flat_Field_Normalization(time)` codes:
+- 0: no usable support in an added frame
+- 1: central normalization in an added frame
+- 2: footprint fallback in an added frame
+- 3: copied original trim result, then explicit box mask applied
+
+The reference interval, Epoch endpoints and policy are saved as global attributes.
+Existing q20-only conditional quality/gap/duplicate reports remain in place.
+A temporary trim L1F is written during processing and removed afterward. Allow
+additional temporary disk space for one trimmed file per active worker.
+
+The exact-preservation guarantee applies at L1F for unmasked pixels, relative to
+the trim calculation in this supplied script. L3C need not be identical: extending
+the track changes master-grid construction, coadding windows and swath overlaps.
+This change deliberately does not force two different orbit extents onto the same
+master grid. Compare same-Epoch detector pixels at L1F first when diagnosing bias.
+
+Validation: numerical checks plus synthetic four-filter processing through L3A
+and L3C, including exact trim-overlap equality, duplicate removal and preserved
+gaps. Cloud inference uses a mock, not the trained model. Real orbit validation
+and performance measurements remain to be done on your data.
+
+---
+
+## Existing batch runner guide
+
+The earlier runner guide follows for storage and orchestration details. The
+processing and validation descriptions above supersede earlier compatibility
+claims below.
+
 # AWE pipeline with bounded orbit batches
 
 Run **run_awe_pipeline_batch.py** for the new batch version. It processes five
@@ -16,7 +224,7 @@ Edit the settings at the top of **run_awe_pipeline_batch.py**:
 YEAR = 2023
 MONTH = 11
 SOC_ROOT = Path(r'E:\soc')
-ORBITS_AT_A_TIME = 5
+ORBITS_AT_A_TIME = 10
 WORKERS = 20
 START_STEP = 0
 L0C_SOURCE_ROOT = Path(r'Y:\soc\l0c\version02')
@@ -116,8 +324,7 @@ preflight. Dry run prints the batch commands without changing files.
 
 ## What happens in each batch
 
-Step 0 prepares each selected orbit, with up to four filter workers. Only the
-current bounded batch is prepared. Exact source paths are passed to the copy
+Step 0 prepares each selected orbit, with up to four filter workers. At most one additional batch is preparing or waiting beyond the processing limit. Exact source paths are passed to the copy
 script, so it does not process the rest of the source month. Each orbit has its
 own `step_0.log` and validation record. A preparation failure is isolated and
 logged; it is not automatically retried. Successful orbits then enter:
@@ -153,8 +360,8 @@ the batch is being processed. Temporary files go under `SOC_ROOT/_orbit_work`
 unless overridden. Step 0 writes processed L0C directly into the workspace; steps 1/2 copy existing
 L0C there. Unsaved temporary L0C is removed after flat-fielding succeeds.
 
-Temporary demand is approximately five orbits rather than one with the default
-batch size, plus files retained from failed attempts. Final publication copies
+Temporary demand is at most three five-orbit batches (two processing, one preparing/ready)
+with the default overlap settings, plus files retained from failed attempts. Final publication copies
 one orbit's retained products at a time before deleting its staged copy; allow
 space for that overlap. File publication is atomic per file, not an orbit-wide
 transaction.

@@ -323,7 +323,7 @@ def validate(src, filt, options):
     if count < 1: raise ValueError('Not enough frames for requested co-adding mode')
     cloud_name = None
     if filt == 'q20':
-        cloud_name = next((n for n in ('MLCloud','Processed_MLCloud') if n in src.variables),None)
+        cloud_name = next((n for n in ('Processed_MLCloud','MLCloud') if n in src.variables),None)
         if cloud_name is None: raise ValueError('Q co-adding requires MLCloud or Processed_MLCloud')
         v = src[cloud_name]
         if v.ndim != 3 or v.dimensions[0] != 'time' or v.shape[1] != 3 or v.shape[2] not in (14,15):
@@ -360,7 +360,7 @@ def prepare_output(src, dst, name, count, cloud_name, options):
     if 'Data_Level' in attrs: attrs['Data_Level'] = 'L1A'
     dst.setncatts(attrs)
     names = [n for n in ORDER if n in src.variables or (n == 'MLCloud' and cloud_name)]
-    names += [n for n in src.variables if n not in names]
+    names += [n for n in src.variables if n not in names and n != 'MLCloud_Supported']
     for n in names:
         if cloud_name and n == 'Processed_MLCloud': continue  # converted into MLCloud
         v = src[cloud_name] if n == 'MLCloud' and cloud_name else src[n]
@@ -436,11 +436,21 @@ def process_file(task, options):
                     lat = matrix_cube(read_values(src['Latitude'],sl)).astype(np.float64)
                     lon = matrix_cube(read_values(src['Longitude'],sl)).astype(np.float64)
                     if invert: lon[lon < 0] += 360
-                    trim_edges(counts,lat,lon)
+                    box_mode = getattr(src, 'MLSPB_Mask_Mode', '') in ('boxes_clean_reference', 'boxes_trim_reference')
+                    if box_mode:
+                        # Find the footprint edge from geometry, not an obstructed radiance row.
+                        geometry_counts = np.where(np.isfinite(lat) & np.isfinite(lon), 1, 0).astype(np.uint16)
+                        trim_edges(geometry_counts,lat,lon)
+                        counts[~np.isfinite(lat) | ~np.isfinite(lon)] = 0
+                    else:
+                        trim_edges(counts,lat,lon)
                     cloud = None
+                    cloud_support = None
                     if cloud_name:
                         cloud = read_values(src[cloud_name],sl)
                         cloud = cloud_percentages(cloud, cloud_name, start)
+                        if box_mode and 'MLCloud_Supported' in src.variables:
+                            cloud_support = read_values(src['MLCloud_Supported'],sl) == 1
                     result['read_s'] += time.perf_counter()-t
                     t = time.perf_counter()
                     shape = (end-start,*src['Radiance'].shape[1:])
@@ -457,8 +467,13 @@ def process_file(task, options):
                         if invert: b[b > 180] -= 360
                         rad = out.astype(np.float32)/np.float32(1000)
                         rad[np.isnan(a)] = np.nan
+                        if box_mode: rad[out == 0] = np.nan
                         rad_out[i],lat_out[i],lon_out[i] = disk_plane(rad),disk_plane(a),disk_plane(b)
-                        if cloud_name: ml_out[i] = average_cloud(cloud,i,w,options['cpp_compat'])
+                        if cloud_name:
+                            ml_out[i] = average_cloud(cloud,i,w,options['cpp_compat'])
+                            if cloud_support is not None:
+                                unknown = average_cloud((~cloud_support).astype(np.int32)*100,i,w,options['cpp_compat'])
+                                ml_out[i][unknown > 0] = 100
                     result['coadd_s'] += time.perf_counter()-t
                     t = time.perf_counter()
                     for n,a in zip(IMAGES,(rad_out,lat_out,lon_out)): dst[n][start:end] = a
