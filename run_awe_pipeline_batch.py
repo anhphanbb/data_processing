@@ -37,8 +37,11 @@ _HELPER_SPEC.loader.exec_module(core)
 
 # ----------------------- EDIT SETTINGS HERE -----------------------
 YEAR = 2023
-MONTH = 11
+MONTH = 12
 SOC_ROOT = Path(r'E:\soc')
+SAVE_TO_SERVER = False  # True: publish master grids, L1A, L3A and L3C on server
+SERVER_ROOT = Path(r'Y:\soc')
+VERSION_FOLDER = 'version02_extended'
 GITHUB_ROOT = Path(r'D:\Github')
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS = {
@@ -60,8 +63,8 @@ WORKERS = 20  # Fallback file workers per CPU stage, not per orbit
 # None inherits WORKERS / --workers. Tune one stage at a time.
 STEP_WORKERS = {2: None, 3: None, 5: None, 6: None}
 L0C_SOURCE_ROOT = Path(r'Y:\soc\l0c\version02')
-GLARE_CSV = Path(r"D:\Github\solar_panels\csv\IndividualMonths\glare_intervals_Nov2023.csv")  # None: SCRIPT_DIR/csv/IndividualMonths/glare_intervals_MonYYYY.csv
-SAVE_L0C = True  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
+GLARE_CSV = Path(r"D:\Github\solar_panels\csv\IndividualMonths\glare_intervals_Dec2023.csv")  # None: SCRIPT_DIR/csv/IndividualMonths/glare_intervals_MonYYYY.csv
+SAVE_L0C = False  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
 SAVE_L0D = False
 SAVE_L1F = False
 SAVE_L1R = False
@@ -180,7 +183,7 @@ def save_products(paths, permanent, job, args, logdir):
         for source in orbit_files(paths[level],orbit):
             if source.suffix not in ('.nc','.mgf'): continue
             if level == 'l1r' and source.suffix == '.nc' and not args.save_l1r: continue
-            products.append((source,permanent[level]/source.relative_to(paths[level])))
+            products.append((source,core.product_target(source,level,paths,permanent)))
     if not products: raise ValueError(f'Orbit {orbit}: no products to publish')
     if not args.overwrite:
         for _,dst in products:
@@ -651,6 +654,10 @@ def main(argv=None):
     p.add_argument('--year',type=int,default=YEAR)
     p.add_argument('--month',type=int,default=MONTH)
     p.add_argument('--soc-root',type=Path,default=SOC_ROOT)
+    p.add_argument('--save-to-server',action=argparse.BooleanOptionalAction,default=SAVE_TO_SERVER)
+    p.add_argument('--server-root',type=Path,default=SERVER_ROOT)
+    p.add_argument('--version-folder',default=VERSION_FOLDER)
+    p.add_argument('--logs-root',type=Path,default=SCRIPT_DIR/'pipeline_logs')
     p.add_argument('--l0c-source-root',type=Path,default=L0C_SOURCE_ROOT)
     p.add_argument('--glare-csv',type=Path,default=GLARE_CSV)
     p.add_argument('--save-l0c',action=argparse.BooleanOptionalAction,default=SAVE_L0C)
@@ -684,10 +691,11 @@ def main(argv=None):
     if args.orbits and any(o < 0 or o > 99999 for o in args.orbits): p.error('Orbit must be 0..99999')
     configure_core()
     args.soc_root = args.soc_root.expanduser().resolve()
-    permanent = core.month_paths(args.soc_root,args.year,args.month)
+    permanent = core.permanent_paths(args)
+    core.print_storage(permanent, args)
     requested = {f'{o:05d}' for o in args.orbits} if args.orbits else None
     groups = core.discover_orbits(core.input_folder(args,permanent),requested)
-    work_root = (args.work_root or args.soc_root/'_orbit_work').expanduser().resolve()
+    work_root = (args.work_root or SCRIPT_DIR/'_orbit_work').expanduser().resolve()
     print(f'Batch size={args.orbits_at_a_time}; total file workers={args.workers}; '
           f'save L0C/L0D/L1F/L1R={args.save_l0c}/{args.save_l0d}/{args.save_l1f}/{args.save_l1r}',flush=True)
     print(f'CPU file workers by step: {args.step_workers}',flush=True)
@@ -710,8 +718,8 @@ def main(argv=None):
         if not Path(SCRIPTS[step]).is_file(): raise FileNotFoundError(f'Step {step}: {SCRIPTS[step]}')
     for exe in (PYTHON_EXE,ML_PYTHON_EXE):
         if not Path(exe).is_file(): raise FileNotFoundError(f'Python interpreter: {exe}')
-    receipts = args.soc_root/'pipeline_orbit_state'/f'{args.year:04d}'/f'{args.month:02d}'
-    run_logs = args.soc_root/'pipeline_logs'/f'{args.year:04d}'/f'{args.month:02d}'/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    receipts = SCRIPT_DIR/'pipeline_orbit_state'/f'{args.year:04d}'/f'{args.month:02d}'
+    run_logs = args.logs_root.expanduser().resolve()/f'{args.year:04d}'/f'{args.month:02d}'/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     run_logs.mkdir(parents=True,exist_ok=True)
     records = []
     QUALITY_RESULTS.clear()
@@ -750,6 +758,8 @@ def main(argv=None):
                     levels = (('l0c',) if args.start_step == 0 and args.save_l0c else ()) + (('l0d',) if args.start_step<=1 and args.save_l0d else ()) + ('l1f','l1r','l1c','l1a','l2a','l3a','l3c')
                     existing = [f for level in levels for f in orbit_files(permanent[level],orbit)
                                 if f.suffix in ('.nc','.mgf')]
+                    master = permanent['master']/f'Master{orbit}.mgf'
+                    if master.exists() and master not in existing: existing.append(master)
                     if existing:
                         raise FileExistsError(f'Orbit {orbit}: existing outputs without a matching batch receipt; '
                                               'select new orbits or use --overwrite to reprocess')

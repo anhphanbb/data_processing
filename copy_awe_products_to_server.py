@@ -27,10 +27,10 @@ import time
 # ------------------------- SETTINGS -------------------------
 SOURCE_ROOT = Path(r"E:\soc")
 SERVER_ROOT = Path(r"Y:\soc")  # A UNC path can also be used.
-VERSION_FOLDER = "version02"
+VERSION_FOLDER = "version02_extended"
 YEAR = 2023
-MONTH = 12
-L3A_RESOLUTIONS = (2,)  # Use (2,) to copy only L3A 2x2.
+MONTH = 11
+L3A_RESOLUTIONS = (2,10)  # Use (2,) to copy only L3A 2x2.
 OVERWRITE = False         # True replaces existing files of the same name.
 DRY_RUN = False           # True lists actions without writing anything.
 VERIFY_SHA256 = False    # True also rereads and compares file contents.

@@ -25,6 +25,9 @@ import uuid
 YEAR = 2023
 MONTH = 11
 SOC_ROOT = Path(r'E:\soc')
+SAVE_TO_SERVER = False  # True: publish master grids, L1A, L3A and L3C on server
+SERVER_ROOT = Path(r'Y:\soc')
+VERSION_FOLDER = 'version02_extended'
 SCRIPT_DIR = Path(__file__).resolve().parent
 GITHUB_ROOT = Path(r'D:\Github')
 SCRIPTS = {
@@ -61,6 +64,33 @@ INPUT_RE = re.compile(r'^awe_l0c_(q20|p12|p14|bkg)_(\d{7}T\d{4})_(\d{5})_(v\d+)(
 
 def month_paths(root, year, month):
     return {level: Path(root)/level/f'{year:04d}'/f'{month:02d}' for level in LEVELS}
+
+
+def permanent_paths(args):
+    paths = month_paths(args.soc_root, args.year, args.month)
+    paths['master'] = paths['l1r']
+    if args.save_to_server:
+        version = args.version_folder
+        if not version or version in ('.', '..') or any(c in version for c in '/\\:'):
+            raise ValueError('version-folder must be a single directory name')
+        server = args.server_root.expanduser().resolve()
+        if not server.is_dir():
+            raise FileNotFoundError(f'Server root unavailable: {server}')
+        for level in ('l1a', 'l3a', 'l3c'):
+            paths[level] = server/level/version/f'{args.year:04d}'/f'{args.month:02d}'
+        paths['master'] = server/'l1r'/version/f'{args.year:04d}'/f'{args.month:02d}'
+    return paths
+
+
+def product_target(source, level, paths, permanent):
+    root = permanent['master'] if source.suffix == '.mgf' else permanent[level]
+    return root/source.relative_to(paths[level])
+
+
+def print_storage(permanent, args):
+    for level in ('master', 'l1a', 'l3a', 'l3c'):
+        print(f'Final {level}: {permanent[level]}', flush=True)
+    print(f'Logs: {args.logs_root.expanduser().resolve()}', flush=True)
 
 
 def discover_orbits(folder, requested=None):
@@ -350,6 +380,7 @@ def fingerprint(group, args):
     """Completion receipts depend on inputs, script bytes, and run settings."""
     payload = {'inputs':[(str(p.resolve()),p.stat().st_size,p.stat().st_mtime_ns)
                           for p in sorted(group.values())],
+               'storage': {k: str(v) for k,v in permanent_paths(args).items()},
                'settings':[args.start_step,args.save_l0c,args.save_l0d,args.save_l1f,args.save_l1r,args.workers,
                            RESOLUTIONS,EXTRA_ARGS,str(PYTHON_EXE),str(ML_PYTHON_EXE),
                            getattr(args,'step_workers',{})],
@@ -375,7 +406,14 @@ def publish_file(source, target):
     target.parent.mkdir(parents=True,exist_ok=True)
     temporary = target.with_name(target.name+'.'+uuid.uuid4().hex+'.partial')
     try:
-        shutil.copy2(source,temporary)
+        # Byte-only copying supports shares that reject copystat (WinError 50).
+        before = source.stat()
+        shutil.copyfile(source,temporary)
+        after = source.stat()
+        if temporary.stat().st_size != before.st_size:
+            raise OSError(f'Incomplete transfer: {target}')
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise OSError(f'Source changed during transfer: {source}')
         os.replace(temporary,target)
     finally:
         if temporary.exists(): temporary.unlink()
@@ -423,7 +461,7 @@ def process_one(orbit, group, args, permanent, work, logdir, receipt, signature)
             if level == 'l1f' and not args.save_l1f: continue
             for source in sorted(paths[level].rglob('*')):
                 if not source.is_file() or source.suffix not in ('.nc','.mgf'): continue
-                target = permanent[level]/source.relative_to(paths[level])
+                target = product_target(source, level, paths, permanent)
                 products.append((source,target))
         if not products: raise ValueError('No products to publish')
         conflicts = [str(dst) for _,dst in products if dst.exists()]
@@ -453,10 +491,14 @@ def main(argv=None):
     p.add_argument('--year',type=int,default=YEAR)
     p.add_argument('--month',type=int,default=MONTH)
     p.add_argument('--soc-root',type=Path,default=SOC_ROOT)
+    p.add_argument('--save-to-server',action=argparse.BooleanOptionalAction,default=SAVE_TO_SERVER)
+    p.add_argument('--server-root',type=Path,default=SERVER_ROOT)
+    p.add_argument('--version-folder',default=VERSION_FOLDER)
+    p.add_argument('--logs-root',type=Path,default=SCRIPT_DIR/'pipeline_logs')
     p.add_argument('--l0c-source-root',type=Path,default=L0C_SOURCE_ROOT)
     p.add_argument('--glare-csv',type=Path,default=GLARE_CSV)
     p.add_argument('--save-l0c',action=argparse.BooleanOptionalAction,default=SAVE_L0C)
-    p.add_argument('--work-root',type=Path,help='Temporary parent; default SOC_ROOT/_orbit_work')
+    p.add_argument('--work-root',type=Path,help='Temporary parent; default SCRIPT_DIR/_orbit_work')
     p.add_argument('--orbits',nargs='+',type=int,help='Only these orbit numbers; default all in month')
     p.add_argument('--limit',type=int,help='Maximum number of pending orbits to process')
     p.add_argument('--start-step',type=int,choices=(0,1,2),default=START_STEP)
@@ -473,17 +515,18 @@ def main(argv=None):
     if args.workers < 1 or (args.limit is not None and args.limit < 1): p.error('workers/limit must be positive')
     if args.orbits and any(o < 0 or o > 99999 for o in args.orbits): p.error('Orbit must be 0..99999')
     args.soc_root = args.soc_root.expanduser().resolve()
-    permanent = month_paths(args.soc_root,args.year,args.month)
+    permanent = permanent_paths(args)
+    print_storage(permanent, args)
     requested = {f'{o:05d}' for o in args.orbits} if args.orbits else None
     groups = discover_orbits(input_folder(args,permanent),requested)
     if args.start_step == 2:
         for orbit,group in groups.items():
             q = INPUT_RE.fullmatch(group['q20'].name)
             group['l0d'] = ml_output(permanent['l0d'],'l0d',orbit,q[2],q[4]+'*')
-    work_root = (args.work_root or args.soc_root/'_orbit_work').expanduser().resolve()
-    receipts = args.soc_root/'pipeline_orbit_state'/f'{args.year:04d}'/f'{args.month:02d}'
+    work_root = (args.work_root or SCRIPT_DIR/'_orbit_work').expanduser().resolve()
+    receipts = SCRIPT_DIR/'pipeline_orbit_state'/f'{args.year:04d}'/f'{args.month:02d}'
     print(f'Orbit pipeline: {args.year:04d}/{args.month:02d}; save L0C={args.save_l0c}; save L0D={args.save_l0d}; save L1F={args.save_l1f}; save L1R={args.save_l1r}')
-    print(f'Temporary parent: {work_root}; master grids always retained in {permanent["l1r"]}')
+    print(f'Temporary parent: {work_root}; master grids always retained in {permanent["master"]}')
     if args.dry_run:
         for orbit in list(groups)[:args.limit]:
             print(f'Orbit {orbit}: steps {args.start_step}..6')
@@ -497,7 +540,7 @@ def main(argv=None):
     for exe in (PYTHON_EXE,ML_PYTHON_EXE):
         if not Path(exe).is_file(): raise FileNotFoundError(f'Python interpreter: {exe}')
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    run_logs = args.soc_root/'pipeline_logs'/f'{args.year:04d}'/f'{args.month:02d}'/run_id
+    run_logs = args.logs_root.expanduser().resolve()/f'{args.year:04d}'/f'{args.month:02d}'/run_id
     records = []
     attempted = 0
     run_logs.mkdir(parents=True,exist_ok=True)
@@ -520,7 +563,7 @@ def main(argv=None):
                 if not args.overwrite:
                     conflicts = [p for level in (('l0c',) if args.start_step == 0 and args.save_l0c else ()) + (('l0d',) if args.start_step <= 1 and args.save_l0d else ()) + ('l1f','l1r','l1c','l1a','l2a','l3a','l3c')
                                  for p in permanent[level].rglob(f'*_{orbit}_*.nc')]
-                    master = permanent['l1r']/f'Master{orbit}.mgf'
+                    master = permanent['master']/f'Master{orbit}.mgf'
                     if conflicts or master.exists():
                         raise FileExistsError(f'Orbit {orbit} already has outputs but no matching completion receipt. '
                                               'Choose a fresh SOC root or use --overwrite.')
