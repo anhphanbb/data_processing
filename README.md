@@ -1,5 +1,19 @@
 # Folder layout
 
+The current pipeline scripts remain at the repository root. Historical versions
+are preserved under `archive/`:
+
+- `archive/v1(steps_in_sequence)/`
+- `archive/v2/`
+- `archive/v3(batch_of_5)/`
+- `archive/v4(before_filling_gaps)/`
+- `archive/v5(handling_duplicates)/`
+- `archive/v6(bad_frames_removal)/`
+
+Archived scripts, tests, documentation and reports retain their original contents;
+their historical settings apply only to those snapshots. Generated logs, temporary
+products and model weights stay local.
+
 Both runners default to November 2023 with server publishing and L1R retention
 enabled. L1R (including master grids), L1A, L3A and L3C are published under
 `Y:\soc\<level>\version02p1\2023\11` (L3A retains its resolution subfolders).
