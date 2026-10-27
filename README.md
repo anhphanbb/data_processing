@@ -1,3 +1,28 @@
+# Folder layout
+
+Both runners default to November 2023 with server publishing and L1R retention
+enabled. L1R (including master grids), L1A, L3A and L3C are published under
+`Y:\soc\<level>\version02p1\2023\11` (L3A retains its resolution subfolders).
+Raw L0C inputs still come from `Y:\soc\l0c\version02\2023\11`; filenames retain
+their `v02` suffix. The standalone copy script also includes L1R and defaults to
+`version02p1` for November 2023.
+
+MLSPB-flagged pixels are retained in L1F, L1R and L1C Radiance. The compressed
+`MLSPB_Pixel_Mask` variable follows Radiance dimensions: 1 excludes a sample,
+0 leaves it eligible (normal geometry, missing-data and brightness checks still apply).
+Filtering and normalization of clean pixels still exclude flagged input. Added
+frames retain separately processed values inside flagged boxes; the trim overlap
+is copied exactly. Intrinsically missing pixels remain missing.
+Regridding marks a target pixel if any of its four source corners is flagged.
+MLCloud masks its inference copy, and coadding excludes flagged samples before
+averaging. L1A consumes the mask rather than copying a center-frame mask onto an
+average. Older NaN-masked products remain supported. Regenerate from L1F onward
+to obtain retained pixels; existing output files are not updated automatically.
+
+The active runners use the ML scripts and config.txt beside them. Model weights
+remain local in models/; models/manifest.json records the expected hashes.
+Glare annotations default to csv/all_months.csv; combine_monthly_csv.py rebuilds it.
+
 # AWE pipeline: selective retries and three-batch scheduling
 
 Replace both runners together: `run_awe_pipeline_batch.py` and
@@ -232,7 +257,7 @@ GLARE_CSV = None
 SAVE_L0C = False
 SAVE_L0D = False
 SAVE_L1F = False
-SAVE_L1R = False
+SAVE_L1R = True
 CONTINUE_ON_ERROR = True
 OVERWRITE = True
 ```

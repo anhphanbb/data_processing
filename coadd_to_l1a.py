@@ -360,7 +360,9 @@ def prepare_output(src, dst, name, count, cloud_name, options):
     if 'Data_Level' in attrs: attrs['Data_Level'] = 'L1A'
     dst.setncatts(attrs)
     names = [n for n in ORDER if n in src.variables or (n == 'MLCloud' and cloud_name)]
-    names += [n for n in src.variables if n not in names and n != 'MLCloud_Supported']
+    names += [n for n in src.variables if n not in names and n not in ('MLCloud_Supported', 'MLSPB_Pixel_Mask')]
+    if 'MLSPB_Pixel_Mask' in src.variables:
+        dst.MLSPB_Radiance_Policy = 'Flagged samples excluded before coadding; output Radiance contains science averages'
     for n in names:
         if cloud_name and n == 'Processed_MLCloud': continue  # converted into MLCloud
         v = src[cloud_name] if n == 'MLCloud' and cloud_name else src[n]
@@ -433,6 +435,8 @@ def process_file(task, options):
                     t = time.perf_counter()
                     sl = slice(start,end+w-1)
                     counts = to_counts(matrix_cube(read_values(src['Radiance'],sl)))
+                    if 'MLSPB_Pixel_Mask' in src.variables:
+                        counts[matrix_cube(read_values(src['MLSPB_Pixel_Mask'],sl)) != 0] = 0
                     lat = matrix_cube(read_values(src['Latitude'],sl)).astype(np.float64)
                     lon = matrix_cube(read_values(src['Longitude'],sl)).astype(np.float64)
                     if invert: lon[lon < 0] += 360

@@ -37,19 +37,18 @@ _HELPER_SPEC.loader.exec_module(core)
 
 # ----------------------- EDIT SETTINGS HERE -----------------------
 YEAR = 2023
-MONTH = 12
+MONTH = 11
 SOC_ROOT = Path(r'E:\soc')
-SAVE_TO_SERVER = False  # True: publish master grids, L1A, L3A and L3C on server
+SAVE_TO_SERVER = True  # True: publish master grids, L1R, L1A, L3A and L3C on server
 SERVER_ROOT = Path(r'Y:\soc')
-VERSION_FOLDER = 'version02_extended'
-GITHUB_ROOT = Path(r'D:\Github')
+VERSION_FOLDER = 'version02p1'
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS = {
-    0: GITHUB_ROOT/'solar_panels'/'0_copy_and_remove_glare.py',
-    1: GITHUB_ROOT/'solar_panels'/'4_and_5_mlspb.py',
+    0: SCRIPT_DIR/'0_copy_and_remove_glare.py',
+    1: SCRIPT_DIR/'4_and_5_mlspb.py',
     2: SCRIPT_DIR/'filter_flatfield_to_1lf.py',
     3: SCRIPT_DIR/'regrid_l1f_to_l1r.py',
-    4: GITHUB_ROOT/'cloud_restructured'/'4_and_5_mlcloud.py',
+    4: SCRIPT_DIR/'4_and_5_mlcloud.py',
     5: SCRIPT_DIR/'coadd_to_l1a.py',
     6: SCRIPT_DIR/'generate_l2a_l3a_l3c.py',
 }
@@ -61,13 +60,13 @@ OVERLAP_BATCHES = True
 MAX_PROCESSING_BATCHES = 3  # Plus at most one preparing/prepared batch
 WORKERS = 20  # Fallback file workers per CPU stage, not per orbit
 # None inherits WORKERS / --workers. Tune one stage at a time.
-STEP_WORKERS = {2: None, 3: None, 5: None, 6: None}
+STEP_WORKERS = {2: None, 3: None, 5: 10, 6: None}
 L0C_SOURCE_ROOT = Path(r'Y:\soc\l0c\version02')
-GLARE_CSV = Path(r"D:\Github\solar_panels\csv\IndividualMonths\glare_intervals_Dec2023.csv")  # None: SCRIPT_DIR/csv/IndividualMonths/glare_intervals_MonYYYY.csv
+GLARE_CSV = None  # None: SCRIPT_DIR/csv/all_months.csv
 SAVE_L0C = False  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
 SAVE_L0D = False
 SAVE_L1F = False
-SAVE_L1R = False
+SAVE_L1R = True
 CONTINUE_ON_ERROR = True
 OVERWRITE = True  # Set True to reprocess and replace matching outputs
 START_STEP = 0  # 0: copy/remove glare; 1: existing L0C; 2: existing L0C + L0D
@@ -661,7 +660,13 @@ def main(argv=None):
     p.add_argument('--l0c-source-root',type=Path,default=L0C_SOURCE_ROOT)
     p.add_argument('--glare-csv',type=Path,default=GLARE_CSV)
     p.add_argument('--save-l0c',action=argparse.BooleanOptionalAction,default=SAVE_L0C)
-    p.add_argument('--work-root',type=Path)
+    #p.add_argument('--work-root',type=Path)
+    p.add_argument(
+        '--work-root',
+        type=Path,
+        default=Path(r'E:\_orbit_work') if Path('E:/').is_dir()
+        else SCRIPT_DIR / '_orbit_work',
+    )
     p.add_argument('--orbits',nargs='+',type=int)
     p.add_argument('--limit',type=int,help='Maximum pending orbit attempts, including failures')
     p.add_argument('--orbits-at-a-time','--batch-size',dest='orbits_at_a_time',type=int,default=ORBITS_AT_A_TIME)

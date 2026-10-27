@@ -1,3 +1,10 @@
 __pycache__/
 epoch_continuity_reports/
 epoch_product_reports/
+pipeline_logs/
+pipeline_orbit_state/
+
+# Local model assets and temporary validation products
+models/*.h5
+_orbit_work/
+validation_outputs/

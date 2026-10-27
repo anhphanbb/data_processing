@@ -356,8 +356,12 @@ def validate(ds):
     for name in ('Latitude', 'Longitude'):
         if ds[name].dimensions != dims or ds[name].shape != ds['Radiance'].shape:
             raise ValueError(f'{name} must match Radiance dimensions and shape')
+    if 'MLSPB_Pixel_Mask' in ds.variables:
+        mask = ds['MLSPB_Pixel_Mask']
+        if mask.dimensions != dims or mask.shape != ds['Radiance'].shape:
+            raise ValueError('MLSPB_Pixel_Mask must match Radiance dimensions and shape')
     for name, var in ds.variables.items():
-        if name not in ('Radiance','Latitude','Longitude') and any(d in dims[1:] for d in var.dimensions):
+        if name not in ('Radiance','Latitude','Longitude','MLSPB_Pixel_Mask') and any(d in dims[1:] for d in var.dimensions):
             raise ValueError(f'Unsupported spatial variable {name}: {var.dimensions}')
     a,b = centers(ds)
     if len(a) != ds['Radiance'].shape[0] or len(a) == 0:
@@ -388,12 +392,12 @@ def prepare_output(src, dst, output_name, block):
                  Logical_source=output_name[:11])
     dst.setncatts(attrs)
     for name,var in src.variables.items():
-        image = name in ('Radiance','Latitude','Longitude')
+        image = name in ('Radiance','Latitude','Longitude','MLSPB_Pixel_Mask')
         dims = ('time','y_cross_track','x_along_track') if image else var.dimensions
         kwargs = {'zlib':True, 'complevel':1, 'shuffle':True} if dims else {}
         if image: kwargs['chunksizes'] = (1, SIZE, SIZE)
         if '_FillValue' in var.ncattrs(): kwargs['fill_value'] = var.getncattr('_FillValue')
-        out = dst.createVariable(name, 'f4' if image else var.datatype, dims, **kwargs)
+        out = dst.createVariable(name, 'u1' if name == 'MLSPB_Pixel_Mask' else 'f4' if image else var.datatype, dims, **kwargs)
         att = {n:var.getncattr(n) for n in var.ncattrs() if n != '_FillValue'}
         if image:
             # Arrays are written as unpacked float32 physical values.
@@ -465,6 +469,17 @@ def process_file(source, target, master_lat, master_lon, positions, invert, opti
                         timing['map_hits']+=int(hit)
                         tick=time.perf_counter()
                         result,valid=apply_map(counts,indices,weights)
+                        if 'MLSPB_Pixel_Mask' in src.variables:
+                            # Match the radiance stencil, including zero-weight corners:
+                            # legacy NaNs invalidated any stencil touching a flagged pixel.
+                            excluded = np.asarray(src['MLSPB_Pixel_Mask'][i], dtype=bool)[::-1,:].T
+                            x, y = indices
+                            mapped = x >= 0
+                            target_mask = np.zeros(x.shape, dtype=np.uint8)
+                            mx, my = x[mapped], y[mapped]
+                            target_mask[mapped] = (excluded[mx,my] | excluded[mx+1,my]
+                                                   | excluded[mx,my+1] | excluded[mx+1,my+1])
+                            dst['MLSPB_Pixel_Mask'][i] = disk_plane(target_mask)
                         timing['apply_s']+=time.perf_counter()-tick
                         tick=time.perf_counter()
                         # Missing brightness must not remove grid anchors used downstream.

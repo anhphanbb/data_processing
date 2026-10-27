@@ -4,7 +4,8 @@ r"""Filter/flat-field AWE files after removing later duplicate Epoch frames.
 Gaps of any length and positive irregular intervals are preserved and reported.
 No gap interpolation, no filled/unfilled branches, no long-gap skipping.
 Backward or invalid Epoch still fail; all filters must share the removal map.
-Default: mask MLSPB boxes, retain all observed frames, and use the exact legacy trim flat field before extending.
+Default: retain MLSPB pixels with a separate exclusion mask, retain all observed frames,
+and use the exact legacy trim flat field before extending.
 Use --mlspb-mode trim for the legacy frame-selection algorithm.
 Retained samples are read directly from original files through a shared index map.
 No full cleaned-input copy is made; filtering/flat-fielding still modifies Radiance.
@@ -62,7 +63,7 @@ DEFAULT_SELECTION_MODE = "cxx"  # Legacy trim mode: "cxx" or "clean"
 DEFAULT_MLSPB_MODE = "boxes"  # "boxes" or "trim"
 DEFAULT_MIN_CLEAN_FRAMES = 100  # Operational guard; validate with real orbits
 BAD_FRAME_SCREENING = True  # False disables screening, removal and previews.
-SAVE_BAD_FRAME_IMAGES = True
+SAVE_BAD_FRAME_IMAGES = False
 BKG_SCREENING_TOLERANCE = 1.5  # Temporal brightness outliers only: 1.0 original, 2.0 twice tolerance.
 TEMP_ROOT = None  # None: beside L1F outputs; or set a fast local SSD folder.
 DEFAULT_RECURSIVE = False
@@ -548,7 +549,7 @@ def process_box_masked_file(input_path, output_path, boxes, reference, overwrite
 
 def _extend_trim_result(input_path, output_path, baseline_path, boxes, reference,
                         ff, label, quality_metrics, frame_indices=None):
-    """Copy unmasked baseline values exactly; calculate only the added frames."""
+    """Preserve baseline values and store exclusions separately from radiance."""
     netCDF4 = _import_netcdf4()
     lo, hi = reference
     with netCDF4.Dataset(input_path) as src, netCDF4.Dataset(baseline_path) as baseline:
@@ -572,13 +573,18 @@ def _extend_trim_result(input_path, output_path, baseline_path, boxes, reference
                 dst.Flat_Field_Reference_Frames = int(hi-lo)
                 dst.Flat_Field_Reference_Epoch = np.array([read_epoch(input_path)[indices[lo]], read_epoch(input_path)[indices[hi-1]]])
                 dst.Flat_Field_Policy = 'Exact legacy trim interval, filtering, denominator and normalization; copy baseline then extend using its frozen flat field'
-                dst.Trim_Overlap_Policy = 'Baseline Radiance copied exactly except explicitly MLSPB-masked boxes become NaN'
+                dst.Trim_Overlap_Policy = 'Baseline Radiance copied exactly; MLSPB exclusions stored separately'
+                dst.MLSPB_Radiance_Policy = 'Pixels retained; exclude MLSPB_Pixel_Mask samples from science averages'
                 dst.MLSPB_Box_Ranges = json.dumps(MLSPB_RANGES)
                 dst.Missing_Radiance_Policy = 'NaN missing; coordinates retained for geometry'
                 code = dst.createVariable('Flat_Field_Normalization', 'u1', ('time',), fill_value=False)
                 code.flag_values = np.array([0, 1, 2, 3], dtype='u1')
                 code.flag_meanings = 'no_valid_support central_20x20 valid_footprint_fallback copied_legacy_trim'
                 countvar = dst.createVariable('MLSPB_Masked_Pixels', 'i4', ('time',), fill_value=False)
+                maskvar = dst.createVariable('MLSPB_Pixel_Mask', 'u1', dst[RADIANCE_NAME].dimensions,
+                                            zlib=True, complevel=4, fill_value=False)
+                maskvar.flag_values = np.array([0, 1], dtype='u1')
+                maskvar.flag_meanings = 'unflagged exclude_from_averages'
                 dst[RADIANCE_NAME].set_auto_maskandscale(False)
                 fallbacks = empty = 0
                 for start in range(0, len(boxes), RADIANCE_READ_BLOCK_SIZE):
@@ -593,12 +599,21 @@ def _extend_trim_result(input_path, output_path, baseline_path, boxes, reference
                         if lo <= i < hi:
                             # Do not re-filter, re-normalize, or quantize baseline values.
                             saved[q] = _read_image_block(baseline[RADIANCE_NAME], i-lo, i-lo+1)[0]
-                            saved[q][box_mask(boxes[i])] = np.nan
                             method = 3
                         else:
                             filtered = CPP_FLOAT32_ROUNDTRIP_LUT[filter_image_masked(radiance_to_cpp_uint16(raw), valid)]
                             corrected, method = flatfield_image_masked(filtered, ff, valid)
                             saved[q] = corrected.astype(np.float32)/np.float32(RADIANCE_SCALE)
+                            # Retain a processed value for flagged pixels without letting
+                            # their brightness affect clean-pixel filtering/normalization.
+                            excluded = box_mask(boxes[i])
+                            if excluded.any():
+                                physical = np.isfinite(raw) & (raw >= 0)
+                                if geo is not None: physical &= geo
+                                full_filtered = CPP_FLOAT32_ROUNDTRIP_LUT[filter_image_masked(radiance_to_cpp_uint16(raw), physical)]
+                                full_corrected, _ = flatfield_image_masked(full_filtered, ff, physical)
+                                saved[q][excluded] = (full_corrected.astype(np.float32)/np.float32(RADIANCE_SCALE))[excluded]
+                        maskvar[i] = box_mask(boxes[i]).astype('u1')
                         methods.append(method); masked.append(int(box_mask(boxes[i]).sum()))
                         fallbacks += method == 2; empty += method == 0
                     _write_image_block(dst[RADIANCE_NAME], start, saved)

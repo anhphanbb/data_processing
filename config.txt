@@ -1,0 +1,6 @@
+space = 8,
+min_radiance = 0,
+max_radiance = 20,
+cloud_chance = 0.5,
+no_cloud_chance = 0.1,
+threshold = 3

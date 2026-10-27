@@ -1,4 +1,4 @@
-"""Copy completed AWE L1A, L3A and L3C monthly products to a mapped server.
+"""Copy completed AWE L1R, L1A, L3A and L3C monthly products to a mapped server.
 
 Edit SETTINGS and run in Spyder, or use:
     python copy_awe_products_to_server.py --year 2023 --month 11
@@ -27,7 +27,7 @@ import time
 # ------------------------- SETTINGS -------------------------
 SOURCE_ROOT = Path(r"E:\soc")
 SERVER_ROOT = Path(r"Y:\soc")  # A UNC path can also be used.
-VERSION_FOLDER = "version02_extended"
+VERSION_FOLDER = "version02p1"
 YEAR = 2023
 MONTH = 11
 L3A_RESOLUTIONS = (2,10)  # Use (2,) to copy only L3A 2x2.
@@ -39,6 +39,7 @@ VERIFY_SHA256 = False    # True also rereads and compares file contents.
 
 def folder_pairs(source_root, server_root, version, year, month, resolutions):
     ym = Path(f"{year:04d}") / f"{month:02d}"
+    yield "l1r", source_root / "l1r" / ym, server_root / "l1r" / version / ym
     yield "l1a", source_root / "l1a" / ym, server_root / "l1a" / version / ym
     for resolution in dict.fromkeys(resolutions):
         sub = f"{resolution}x{resolution}"

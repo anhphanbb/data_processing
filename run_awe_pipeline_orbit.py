@@ -25,28 +25,27 @@ import uuid
 YEAR = 2023
 MONTH = 11
 SOC_ROOT = Path(r'E:\soc')
-SAVE_TO_SERVER = False  # True: publish master grids, L1A, L3A and L3C on server
+SAVE_TO_SERVER = True  # True: publish master grids, L1R, L1A, L3A and L3C on server
 SERVER_ROOT = Path(r'Y:\soc')
-VERSION_FOLDER = 'version02_extended'
+VERSION_FOLDER = 'version02p1'
 SCRIPT_DIR = Path(__file__).resolve().parent
-GITHUB_ROOT = Path(r'D:\Github')
 SCRIPTS = {
     0: SCRIPT_DIR / '0_copy_and_remove_glare.py',
-    1: GITHUB_ROOT / 'solar_panels' / '4_and_5_mlspb.py',
+    1: SCRIPT_DIR / '4_and_5_mlspb.py',
     2: SCRIPT_DIR / 'filter_flatfield_to_1lf.py',
     3: SCRIPT_DIR / 'regrid_l1f_to_l1r.py',
-    4: GITHUB_ROOT / 'cloud_restructured' / '4_and_5_mlcloud.py',
+    4: SCRIPT_DIR / '4_and_5_mlcloud.py',
     5: SCRIPT_DIR / 'coadd_to_l1a.py',
     6: SCRIPT_DIR / 'generate_l2a_l3a_l3c.py',
 }
 PYTHON_EXE = sys.executable
 ML_PYTHON_EXE = sys.executable
 L0C_SOURCE_ROOT = Path(r'Y:\soc\l0c\version02')
-GLARE_CSV = None  # None: SCRIPT_DIR/csv/IndividualMonths/glare_intervals_MonYYYY.csv
+GLARE_CSV = None  # None: SCRIPT_DIR/csv/all_months.csv
 SAVE_L0C = False  # Save processed L0C to SOC_ROOT/l0c/YYYY/MM
 SAVE_L0D = False
 SAVE_L1F = False
-SAVE_L1R = False
+SAVE_L1R = True
 CONTINUE_ON_ERROR = True  # Log a failed orbit and try the next one
 START_STEP = 0  # 0: copy/remove glare; 1: existing L0C; 2: existing L0C + L0D
 WORKERS = 4     # Parallel filters WITHIN one orbit
@@ -76,7 +75,7 @@ def permanent_paths(args):
         server = args.server_root.expanduser().resolve()
         if not server.is_dir():
             raise FileNotFoundError(f'Server root unavailable: {server}')
-        for level in ('l1a', 'l3a', 'l3c'):
+        for level in ('l1r', 'l1a', 'l3a', 'l3c'):
             paths[level] = server/level/version/f'{args.year:04d}'/f'{args.month:02d}'
         paths['master'] = server/'l1r'/version/f'{args.year:04d}'/f'{args.month:02d}'
     return paths
@@ -88,7 +87,7 @@ def product_target(source, level, paths, permanent):
 
 
 def print_storage(permanent, args):
-    for level in ('master', 'l1a', 'l3a', 'l3c'):
+    for level in ('master', 'l1r', 'l1a', 'l3a', 'l3c'):
         print(f'Final {level}: {permanent[level]}', flush=True)
     print(f'Logs: {args.logs_root.expanduser().resolve()}', flush=True)
 
@@ -125,9 +124,7 @@ def input_folder(args, permanent):
     source = (args.l0c_source_root / f'{args.year:04d}' / f'{args.month:02d}').expanduser().resolve()
     if source == permanent['l0c'].resolve():
         raise ValueError('Raw L0C source and processed L0C destination must differ.')
-    months = ('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec')
-    args.glare_csv = (args.glare_csv or SCRIPT_DIR/'csv'/'IndividualMonths'/
-                      f'glare_intervals_{months[args.month-1]}{args.year:04d}.csv').expanduser().resolve()
+    args.glare_csv = (args.glare_csv or SCRIPT_DIR/'csv'/'all_months.csv').expanduser().resolve()
     if not args.glare_csv.is_file(): raise FileNotFoundError(f'Glare CSV: {args.glare_csv}')
     return source
 
@@ -170,7 +167,7 @@ def make_command(step, paths, workers):
 def run_ml_child(script, source, target, overwrite):
     """Load existing ML script, override month paths, then call its main()."""
     script = Path(script).resolve()
-    os.chdir(script.parent)  # Relative models/ paths stay in their own repository.
+    os.chdir(script.parent)  # Relative paths resolve beside the local processing script.
     sys.path.insert(0, str(script.parent))
     spec = importlib.util.spec_from_file_location('_awe_ml_step', script)
     if spec is None or spec.loader is None:

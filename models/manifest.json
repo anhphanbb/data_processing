@@ -1,0 +1,12 @@
+[
+  {
+    "file": "tf_model_cloud_py310_space_8_max_rad_20_oct_27_2025.h5",
+    "bytes": 109063928,
+    "sha256": "c65ca18b33630510fec78b837d731c9383327c706dc7487038cf182edb948fde"
+  },
+  {
+    "file": "tf_model_py310_sp_acc_and_recall_july_27_soc_2_2025.h5",
+    "bytes": 109063920,
+    "sha256": "a0313822c49901f72afbf213183a3385339b6b656c24c4437d2b1b79e232dabd"
+  }
+]
