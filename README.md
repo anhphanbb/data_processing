@@ -1,5 +1,15 @@
 # Folder layout
 
+## SSH input staging (isolated development branch)
+
+The batch runner can download only the remote `v02` inputs needed by its active
+batches, verify SHA-256, and remove raw inputs after successful output publication.
+See [SSH_INPUTS.md](SSH_INPUTS.md) for January 2024 commands, SSH key/agent setup,
+disk requirements, and interrupted-transfer recovery. Use an activated `py310`
+environment; `run_pipeline_py310.cmd` includes a GPU preflight (adjust its local
+Conda paths on another computer). These changes are isolated from any running
+pipeline in the original checkout.
+
 The current pipeline scripts remain at the repository root. Historical versions
 are preserved under `archive/`:
 

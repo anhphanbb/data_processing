@@ -1,12 +1,16 @@
 """Synthetic checks; no trained model or AWE files required. Run beside revised scripts."""
 from pathlib import Path
 import importlib.util
+import os
 import sys
 import tempfile
 import numpy as np
 from netCDF4 import Dataset
 
 ROOT = Path(__file__).resolve().parents[1]
+# Numba cache files contain importable module names. Keep synthetic-test caches
+# out of the production scripts' __pycache__, including in spawned workers.
+os.environ['NUMBA_CACHE_DIR'] = str(ROOT / '.numba_test_cache')
 
 def load(name, filename):
     spec = importlib.util.spec_from_file_location(name, ROOT/filename)
@@ -14,11 +18,11 @@ def load(name, filename):
     spec.loader.exec_module(module)
     return module
 
-ff = load('box_ff', 'filter_flatfield_to_1lf.py')
-rg = load('box_regrid', 'regrid_l1f_to_l1r.py')
-cl = load('box_cloud', '4_and_5_mlcloud.py')
-co = load('box_coadd', 'coadd_to_l1a.py')
-gen = load('box_products', 'generate_l2a_l3a_l3c.py')
+ff = load('filter_flatfield_to_1lf', 'filter_flatfield_to_1lf.py')
+rg = load('regrid_l1f_to_l1r', 'regrid_l1f_to_l1r.py')
+cl = load('4_and_5_mlcloud', '4_and_5_mlcloud.py')
+co = load('coadd_to_l1a', 'coadd_to_l1a.py')
+gen = load('generate_l2a_l3a_l3c', 'generate_l2a_l3a_l3c.py')
 
 def values(ds, name):
     return np.asarray(np.ma.filled(np.ma.asarray(ds[name][:], dtype=float), np.nan))

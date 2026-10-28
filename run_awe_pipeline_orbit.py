@@ -137,6 +137,9 @@ def make_glare_command(group, paths, args):
 
 
 def prepare_l0c(orbit, group, paths, args, logdir, records):
+    source = getattr(args, 'ssh_source', None)
+    if source is not None:
+        group = source.stage(orbit, group, run_logged, logdir)
     if args.start_step != 0:
         for filt in FILTERS: shutil.copy2(group[filt],paths['l0c']/group[filt].name)
         return
@@ -375,8 +378,11 @@ def validate_outputs(step, paths, orbit, logdir):
 
 def fingerprint(group, args):
     """Completion receipts depend on inputs, script bytes, and run settings."""
-    payload = {'inputs':[(str(p.resolve()),p.stat().st_size,p.stat().st_mtime_ns)
-                          for p in sorted(group.values())],
+    remote = getattr(args, 'ssh_source', None)
+    payload = {'inputs':([p.signature() for p in sorted(group.values())] if remote else
+                         [(str(p.resolve()),p.stat().st_size,p.stat().st_mtime_ns)
+                          for p in sorted(group.values())]),
+               'ssh_source': remote.identity if remote else None,
                'storage': {k: str(v) for k,v in permanent_paths(args).items()},
                'settings':[args.start_step,args.save_l0c,args.save_l0d,args.save_l1f,args.save_l1r,args.workers,
                            RESOLUTIONS,EXTRA_ARGS,str(PYTHON_EXE),str(ML_PYTHON_EXE),

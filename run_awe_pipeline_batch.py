@@ -21,6 +21,10 @@ import subprocess
 import sys
 import time
 import uuid
+# Spyder may not put this script's directory on the import path.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ssh_batch_inputs
 # Spyder may execute this file without adding its folder to sys.path.
 # Load the exact sibling helper, also avoiding a stale cached copy in Spyder.
 _HELPER_PATH = Path(__file__).resolve().with_name('run_awe_pipeline_orbit.py')
@@ -192,6 +196,8 @@ def save_products(paths, permanent, job, args, logdir):
     completion = logdir/'completion.json'
     completion.write_text(json.dumps({'signature':job['signature'],'products':saved},indent=2),encoding='utf-8')
     core.publish_file(completion,job['receipt'])
+    if getattr(args, 'ssh_source', None) is not None:
+        args.ssh_source.cleanup(orbit, job['group'])
     # Receipt is committed. Remove only this orbit's remaining staged data.
     for folder in paths.values():
         for p in orbit_files(folder,orbit): p.unlink()
@@ -650,6 +656,7 @@ def run_batches(batches, args, permanent, checkpoint):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    ssh_batch_inputs.add_arguments(p)
     p.add_argument('--year',type=int,default=YEAR)
     p.add_argument('--month',type=int,default=MONTH)
     p.add_argument('--soc-root',type=Path,default=SOC_ROOT)
@@ -699,8 +706,20 @@ def main(argv=None):
     permanent = core.permanent_paths(args)
     core.print_storage(permanent, args)
     requested = {f'{o:05d}' for o in args.orbits} if args.orbits else None
-    groups = core.discover_orbits(core.input_folder(args,permanent),requested)
     work_root = (args.work_root or SCRIPT_DIR/'_orbit_work').expanduser().resolve()
+    args.ssh_source = None
+    if args.ssh_host or args.ssh_root:
+        if not args.ssh_host or not args.ssh_root:
+            p.error('--ssh-host and --ssh-root must be supplied together')
+        if args.start_step != 0: p.error('SSH raw input requires --start-step 0')
+        args.glare_csv = (args.glare_csv or SCRIPT_DIR/'csv'/'all_months.csv').expanduser().resolve()
+        if not args.glare_csv.is_file(): raise FileNotFoundError(args.glare_csv)
+        args.ssh_source = ssh_batch_inputs.SSHSource(args.ssh_host, args.ssh_root,
+                            args.ssh_cache_root or work_root/'ssh_inputs', args.ssh_port, args.ssh_key)
+        groups = args.ssh_source.discover(core.INPUT_RE, core.FILTERS, requested, args.year, args.month)
+        print(f'SSH source: {args.ssh_host}:{args.ssh_root}; verified raw cache: {args.ssh_source.cache}',flush=True)
+    else:
+        groups = core.discover_orbits(core.input_folder(args,permanent),requested)
     print(f'Batch size={args.orbits_at_a_time}; total file workers={args.workers}; '
           f'save L0C/L0D/L1F/L1R={args.save_l0c}/{args.save_l0d}/{args.save_l1f}/{args.save_l1r}',flush=True)
     print(f'CPU file workers by step: {args.step_workers}',flush=True)
@@ -713,7 +732,9 @@ def main(argv=None):
             batch = selected[start:start+args.orbits_at_a_time]
             print('Batch: '+', '.join(batch))
             paths = paths_in(work_root/f'preview_batch_{start//args.orbits_at_a_time+1}')
-            if args.start_step == 0:
+            if args.ssh_source is not None:
+                print('SSH dry run: remote inventory only; files download during preparation.')
+            elif args.start_step == 0:
                 for orbit in batch: print(subprocess.list2cmdline(core.make_glare_command(groups[orbit],paths,args)))
             for step in range(max(1,args.start_step),7):
                 print(subprocess.list2cmdline(command_for(step,paths,args,len(batch))))
@@ -752,9 +773,13 @@ def main(argv=None):
                     m = core.INPUT_RE.fullmatch(group['q20'].name)
                     group['l0d'] = core.ml_output(permanent['l0d'],'l0d',orbit,m[2],m[4]+'*')
                 signature = hashlib.sha256((core.fingerprint(group,args)+
-                    hashlib.sha256(Path(__file__).read_bytes()).hexdigest()).encode()).hexdigest()
+                    hashlib.sha256(Path(__file__).read_bytes()).hexdigest()+
+                    (hashlib.sha256(Path(ssh_batch_inputs.__file__).read_bytes()).hexdigest()
+                     if args.ssh_source is not None else '')).encode()).hexdigest()
                 receipt = receipts/f'{orbit}.json'
                 if not args.overwrite and core.receipt_matches(receipt,signature):
+                    if args.ssh_source is not None:
+                        args.ssh_source.cleanup(orbit, group)
                     record['status'] = 'skipped'
                     attempted -= 1
                     print(f'SKIP completed orbit {orbit}',flush=True)
