@@ -46,7 +46,7 @@ the requested year/month are selected; `v22` is ignored. Incomplete/duplicate
 selected orbits are reported before processing starts.
 
 The example writes outputs locally. For server publication, replace
-`--no-save-to-server` with `--save-to-server --server-root Y:\soc --version-folder version02p1`
+`--no-save-to-server` with `--save-to-server --server-root Y:\soc --month-suffix v02p1`
 once that destination is accessible. This destination affects completion receipts,
 so use the same destination for your test and full run.
 
@@ -81,3 +81,5 @@ that orbit's stale lock. Keep partial files and metadata if you want transfer re
 Offline validation: `python -m unittest discover -s tests -p test_ssh_batch_inputs.py`.
 These tests exercise staging and runner integration with simulated transports;
 a real SSH/SFTP orbit transfer still needs to be validated on the target computer.
+
+With `--month-suffix v02p1`, server outputs use `SERVER_ROOT/<level>/2024/01v02p1` (February: `02v02p1`), including L1R and master grids. Without this option the legacy version-folder layout remains available. Local staging paths and product filenames are unchanged.

@@ -663,6 +663,7 @@ def main(argv=None):
     p.add_argument('--save-to-server',action=argparse.BooleanOptionalAction,default=SAVE_TO_SERVER)
     p.add_argument('--server-root',type=Path,default=SERVER_ROOT)
     p.add_argument('--version-folder',default=VERSION_FOLDER)
+    p.add_argument('--month-suffix',default=None,help='Publish to LEVEL/YYYY/MM+SUFFIX instead of LEVEL/VERSION/YYYY/MM (example: v02p1)')
     p.add_argument('--logs-root',type=Path,default=SCRIPT_DIR/'pipeline_logs')
     p.add_argument('--l0c-source-root',type=Path,default=L0C_SOURCE_ROOT)
     p.add_argument('--glare-csv',type=Path,default=GLARE_CSV)

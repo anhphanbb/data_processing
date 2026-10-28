@@ -72,12 +72,16 @@ def permanent_paths(args):
         version = args.version_folder
         if not version or version in ('.', '..') or any(c in version for c in '/\\:'):
             raise ValueError('version-folder must be a single directory name')
+        suffix = getattr(args, 'month_suffix', None)
+        if suffix is not None and (not suffix or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in suffix)):
+            raise ValueError('month-suffix must contain only letters, digits, underscores or hyphens')
         server = args.server_root.expanduser().resolve()
         if not server.is_dir():
             raise FileNotFoundError(f'Server root unavailable: {server}')
         for level in ('l1r', 'l1a', 'l3a', 'l3c'):
-            paths[level] = server/level/version/f'{args.year:04d}'/f'{args.month:02d}'
-        paths['master'] = server/'l1r'/version/f'{args.year:04d}'/f'{args.month:02d}'
+            paths[level] = (server/level/f'{args.year:04d}'/f'{args.month:02d}{suffix}' if suffix is not None
+                            else server/level/version/f'{args.year:04d}'/f'{args.month:02d}')
+        paths['master'] = paths['l1r']
     return paths
 
 
@@ -497,6 +501,7 @@ def main(argv=None):
     p.add_argument('--save-to-server',action=argparse.BooleanOptionalAction,default=SAVE_TO_SERVER)
     p.add_argument('--server-root',type=Path,default=SERVER_ROOT)
     p.add_argument('--version-folder',default=VERSION_FOLDER)
+    p.add_argument('--month-suffix',default=None,help='Publish to LEVEL/YYYY/MM+SUFFIX instead of LEVEL/VERSION/YYYY/MM (example: v02p1)')
     p.add_argument('--logs-root',type=Path,default=SCRIPT_DIR/'pipeline_logs')
     p.add_argument('--l0c-source-root',type=Path,default=L0C_SOURCE_ROOT)
     p.add_argument('--glare-csv',type=Path,default=GLARE_CSV)
