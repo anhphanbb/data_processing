@@ -10,6 +10,23 @@ environment; `run_pipeline_py310.cmd` includes a GPU preflight (adjust its local
 Conda paths on another computer). These changes are isolated from any running
 pipeline in the original checkout.
 
+## Production environment
+
+Use the **activated `py310` Conda environment**. Calling its `python.exe` directly
+does not activate Conda's DLL paths and can make TensorFlow silently fall back to CPU.
+The recommended batch launcher activates the environment and checks GPU visibility:
+
+```powershell
+.\run_pipeline_py310.cmd --year 2023 --month 12 --start-step 0
+```
+
+It uses `C:\ProgramData\anaconda3\Scripts\conda.exe` and
+`C:\Users\domin\.conda\envs\py310`; adjust those two paths when moving machines.
+All batch CLI options are forwarded. For a manual launch, run `conda activate py310`
+first and confirm TensorFlow reports a GPU. Background launches should use
+`conda run --prefix C:\Users\domin\.conda\envs\py310 --no-capture-output`.
+See `AGENTS.md` for the same requirement for future automated runs.
+
 The current pipeline scripts remain at the repository root. Historical versions
 are preserved under `archive/`:
 
@@ -43,16 +60,54 @@ averaging. L1A consumes the mask rather than copying a center-frame mask onto an
 average. Older NaN-masked products remain supported. Regenerate from L1F onward
 to obtain retained pixels; existing output files are not updated automatically.
 
-The active runners use the ML scripts and config.txt beside them. Model weights
-remain local in models/; models/manifest.json records the expected hashes.
-Glare annotations default to csv/all_months.csv; combine_monthly_csv.py rebuilds it.
+## Local MLCloud labeling tool
+
+Double-click `mlcloud_labeler/launch.cmd` to view local L1R/L1C orbits, compare expert labels, edit intervals, save review revisions, and export validated training CSVs. See `mlcloud_labeler/README.md` for frame-alignment requirements and controls.
+
+
+The active pipeline is self-contained in this folder (raw data and Python environments remain external):
+
+- `run_awe_pipeline_batch.py` and `run_awe_pipeline_orbit.py`: active runners.
+- `0_copy_and_remove_glare.py`, `4_and_5_mlspb.py`, `4_and_5_mlcloud.py` and the four scientific processing scripts: active stages.
+- `models/`: the exact SP and MLCloud HDF5 models referenced by these scripts.
+- `config.txt`: MLCloud settings copied with its script (space=8, radiance range 0–20).
+- `csv/all_months.csv`: combined orbit annotations from all 31 month sheets in AweSolarPanels (2).xlsx (14,372 rows, including blank/formula-only source rows). Both runners and the standalone glare stage use this file by default. Year/month/source fields preserve provenance; Orbit is normalized to Orbit #. Original columns and rows, including notes and unnamed columns, are retained.
+- `combine_monthly_csv.py`: rebuilds the combined CSV from `C:\Users\domin\Downloads\AweSolarPanels (2).xlsx` by default (requires openpyxl). Use `--workbook` for another workbook, `--source` to explicitly use legacy monthly CSVs, or `--output` to override the destination. Existing `csv/IndividualMonths/` files remain available for legacy use.
+- `archive/`: preserved v1–v6 script snapshots; historical documentation/settings apply only to those snapshots.
+- `pipeline_logs/`, `pipeline_orbit_state/`, `epoch_continuity_reports/`, `epoch_product_reports/`: retained in place. These generated files are already ignored by Git.
+- `notebooks/`, `remap_orbit_altitude.py`, `copy_awe_products_to_server.py`: retained analysis and utility tools.
+
+The SP stage/model were copied from `D:\Github\solar_panels`; the cloud stage/model and configuration were copied from `D:\Github\cloud_restructured`. Model paths resolve relative to the copied scripts. Originals were left intact. Models are local assets excluded from ordinary Git commits because each is about 109 MB.
+
+For a single-orbit check, use the existing Python 3.10 scientific environment and explicitly select the month and output location. For example:
+
+```powershell
+& C:\Users\domin\.conda\envs\py310\python.exe run_awe_pipeline_batch.py --year 2023 --month 11 --orbits 2 --no-save-to-server --soc-root .\validation_outputs\orbit02 --work-root .\_orbit_work
+```
+
+This uses the configured raw L0C source. Override `--l0c-source-root` if the server is mounted elsewhere. The isolated output location keeps the check separate from existing science products.
+
+
+### Reorganization validation — October 26, 2026
+
+Orbit `00002`, November 2023, completed all seven stages with zero failures and zero retries in 542.3 seconds. Both copied models were used. The runner validated each stage and saved 10 NetCDF products plus `Master00002.mgf` under `validation_outputs/orbit02/`. Logs and the authoritative completion summary are in `pipeline_logs/2023/11/20261026_184307_796873/`.
+
+The run used CPU inference (CUDA DLLs were unavailable in the shell). Quality screening removed three frames; retained cadence gaps are reported by the existing filter. This verifies pipeline execution and built-in product checks, not a full scientific quality assessment.
+
+Exact command used:
+
+```powershell
+& C:\Users\domin\.conda\envs\py310\python.exe run_awe_pipeline_batch.py --year 2023 --month 11 --orbits 2 --no-save-to-server --soc-root D:\Github\data_processing\validation_outputs\orbit02 --work-root D:\Github\data_processing\_orbit_work --l0c-source-root \\smb1.physics.usu.edu\awewrite\soc\l0c\version02 --workers 4 --step-5-workers 4
+```
+
+---
 
 # AWE pipeline: selective retries and three-batch scheduling
 
 Replace both runners together: `run_awe_pipeline_batch.py` and
 `run_awe_pipeline_orbit.py`. The other five Python scripts in this package are
 unchanged copies of your supplied versions. Keep their canonical filenames.
-Step 0, MLSPB and MLCloud scripts/models remain external at the paths in SCRIPTS.
+Step 0, MLSPB and MLCloud scripts/models are local; see the folder layout above.
 
 Review YEAR, MONTH, SOC_ROOT, GLARE_CSV and save flags before running. The supplied
 YEAR=2023, MONTH=11, SAVE_L0C=True and OVERWRITE=True are preserved.
@@ -293,10 +348,23 @@ Set `SAVE_L0C = True` (or `--save-l0c`) to publish those copies to
 they are deleted after flat-fielding passes validation. Raw source files are
 always preserved. Existing saved L0C files are not deleted when saving is off.
 
-`GLARE_CSV = None` selects `csv/IndividualMonths/glare_intervals_Nov2023.csv`
-relative to the runners for November 2023, with the month/year adjusted to
-`YEAR`/`MONTH`. Set an explicit path or use `--glare-csv` for another CSV.
-The CSV must contain `Orbit #`, `glare_initial`, and `glare_final`.
+`GLARE_CSV = None` selects `csv/all_months.csv` relative to the runners.
+Step 0 selects year/month from each input filename and matches its orbit, then
+uses both complete glare intervals where Glare == 1. Missing month coverage
+raises an error. Set `--glare-csv` to override; legacy files containing
+`Orbit #`, `glare_initial`, and `glare_final` remain supported.
+
+Workbook update (October 26, 2026): all monthly sheets now come from the supplied
+`AweSolarPanels (2).xlsx`. February 2025 starts at orbit 6772; the previous CSV
+was an incorrect extraction containing May 2026 orbits. May 2026 orbit 13882's
+second glare interval is corrected to 1264–1358 as instructed by the user.
+`Source File`, `Source Sheet`, `Source Row`, and `Correction` retain provenance.
+The source workbook is unchanged. Rebuild with:
+
+```powershell
+python combine_monthly_csv.py --workbook "C:\Users\domin\Downloads\AweSolarPanels (2).xlsx"
+```
+
 The first and last 10 frames are trimmed, then glare intervals are applied as
 zero-based, inclusive indices in that trimmed sequence. This preserves the
 supplied glare-removal algorithm. Step 0 requires numpy, pandas, and netCDF4.
@@ -310,7 +378,7 @@ Both runners support the same source, CSV, and retention options:
 
 ```bat
 python run_awe_pipeline_batch.py --year 2023 --month 12 --save-l0c
-python run_awe_pipeline_batch.py --l0c-source-root Y:\soc\l0c\version02 --glare-csv D:\Github\data_processing\csv\IndividualMonths\glare_intervals_Dec2023.csv --year 2023 --month 12
+python run_awe_pipeline_batch.py --l0c-source-root Y:\soc\l0c\version02 --glare-csv D:\Github\data_processing\csv\all_months.csv --year 2023 --month 12
 python run_awe_pipeline_batch.py --start-step 1
 ```
 

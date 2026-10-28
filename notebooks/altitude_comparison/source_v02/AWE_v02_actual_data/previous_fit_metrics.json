@@ -1,0 +1,15 @@
+{
+  "slow_velocity_pixels_per_s": [
+    -0.013324039758760706,
+    -0.021161157919749474
+  ],
+  "fast_velocity_pixels_per_s": [
+    0.3376439543212378,
+    -0.4682688679510517
+  ],
+  "slow_peak_support": 248,
+  "fast_peak_support": 230,
+  "slow_median_ncc": 0.5740216141840963,
+  "fast_median_ncc": 0.6558380987125243,
+  "source": "Re-estimated using only matched v02 frames and their actual Epoch differences"
+}

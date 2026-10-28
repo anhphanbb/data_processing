@@ -1,0 +1,16 @@
+{
+  "source": "E:\\soc\\l1r\\2023\\11\\awe_l1r_q20_2023326T0542_00004_v02.nc",
+  "reference_altitude": "85.00 km",
+  "selection": "Exact float64 Epoch equality; no nearest-time substitution or inserted frames",
+  "matched_frames": 49,
+  "missing": [
+    {
+      "v01_frame_index": 958,
+      "epoch": 1384668293.6601562
+    }
+  ],
+  "grid": "Same latitude/longitude grid as earlier demonstration, 0.02 degrees; v02 coordinates use 85 km",
+  "interpolation": "Linear interpolation with NaN radiance vertices retained to preserve missing-data masks",
+  "reference_v01_frame": 955,
+  "reference_v02_frame": 1179
+}

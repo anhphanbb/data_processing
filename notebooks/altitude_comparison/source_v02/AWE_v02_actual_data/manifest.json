@@ -1,0 +1,38 @@
+{
+  "AWE_v02_actual_data.ipynb": {
+    "bytes": 19105,
+    "sha256": "f38c2856327180f3c179ddf461214e278d1b0588cd1354eed3362830a044ce95"
+  },
+  "epoch_mapping.csv": {
+    "bytes": 1443,
+    "sha256": "1997124ef0b68744bab53fd4a8d7ca864fcd357b065b5952ed687559407d8c52"
+  },
+  "metadata.json": {
+    "bytes": 625,
+    "sha256": "4e9fc64042a366b84c860601e5af8b5ba676c0805f5202f0b6a1e507a48da0fd"
+  },
+  "motion_candidates.csv": {
+    "bytes": 172465,
+    "sha256": "4d581be01451339640bf9129fe8654e88724886b1585e22bd5125f3bd70145be"
+  },
+  "original_v02_matched_frames.nc": {
+    "bytes": 13111714,
+    "sha256": "65cb38c00dfb75b85b9be1a4397dd37d9b63790cb6969c8ef9af2b0a562ec09e"
+  },
+  "previous_fit_metrics.json": {
+    "bytes": 426,
+    "sha256": "54627a3d0c8eaf397a01c8e1b2583cfd756978e6de082d7711c7174ee0c43bbd"
+  },
+  "projected_frames.npz": {
+    "bytes": 9961013,
+    "sha256": "a23c38fd1e1648df33f294c6516313f35aed1d0cfc1e79365f1750c300b8c761"
+  },
+  "README.txt": {
+    "bytes": 1228,
+    "sha256": "87538a78e7e3b2f2ee29d6ca928604f95377be4fe7f6741630daea99270f5e05"
+  },
+  "requirements.txt": {
+    "bytes": 35,
+    "sha256": "e2410cb8c8414ef0f2f431b4264a5dd7a195b2946a90b57a2de06f57cbe80f23"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "source_drive_bundle": "https://drive.google.com/file/d/1v1-YsxgAfBnkJXiVAxrjiBJLUOYyt5Rv/view",
+  "source_notebook": "AWE_v02_actual_data.ipynb",
+  "checks": {
+    "85km_regression_rmse": 0.0,
+    "85km_mask_agreement": 1.0,
+    "synthetic_joint_rmse": 0.0008411063245009012,
+    "synthetic_contrast_std_error_below": 0.05,
+    "adjoint_check_passed": true,
+    "all_code_cells_executed": true,
+    "iterations_per_altitude": 64
+  },
+  "remap_altitude_sha256": "fbbf20918f6ae9b0207d418bc9911634cae7065f57e7bca1999f2712d501a536",
+  "notes": "Joint geometry cache omitted from ZIP; generated locally from included source subset when needed."
+}

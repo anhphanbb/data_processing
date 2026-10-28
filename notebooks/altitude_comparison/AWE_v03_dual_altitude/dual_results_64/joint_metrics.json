@@ -1,0 +1,8 @@
+{
+  "rmse": 0.2721810749870939,
+  "stop_code": 7,
+  "iterations": 64,
+  "observations": 771316,
+  "stride": 2,
+  "smoothness": 0.3
+}
